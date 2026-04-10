@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Profiler output (timestamped runs)
+Output/
+
+# macOS
+.DS_Store
+
+# Word documents (use readme file instead)
+*.docx
+
+# IDE (PyCharm)
+.idea/
+
+# Claude Code local config
+.claude/
