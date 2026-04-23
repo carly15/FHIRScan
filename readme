@@ -39,6 +39,39 @@ python fhir_profiler.py \
 # Quiet mode (no progress output)
 python fhir_profiler.py -q /data/fhir ./output
 
+┌─────────────────────────────────────────────────────────────────┐
+│                        PIPELINE OVERVIEW                        │
+└─────────────────────────────────────────────────────────────────┘
+
+     ┌──────────────┐
+     │  JSON Files  │
+     │  (Bundles)   │
+     └──────┬───────┘
+            │
+            ▼
+     ┌──────────────┐
+     │   Extract    │
+     │  Resources   │──────► Group by resourceType
+     └──────┬───────┘
+            │
+            ▼
+     ┌──────────────┐
+     │  Recursive   │
+     │   Traverse   │──────► Generate field paths
+     └──────┬───────┘
+            │
+            ▼
+     ┌──────────────┐
+     │  Accumulate  │
+     │  Statistics  │──────► Per path, per resource type
+     └──────┬───────┘
+            │
+            ▼
+     ┌──────────────┐
+     │   Export     │
+     │   CSVs       │
+     └──────────────┘
+
 
 fhir_profiler/
 ├── __init__.py
