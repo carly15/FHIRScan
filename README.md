@@ -1,4 +1,4 @@
-# FHIRScan — FHIR Dataset Profiler
+# FHIRScan a FHIR Dataset Profiler
 
 A Python tool for analysing large-scale FHIR R4 datasets to understand structure, completeness, and value distributions — without requiring full data flattening.
 
