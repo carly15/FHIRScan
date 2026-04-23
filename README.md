@@ -2,6 +2,8 @@
 
 A Python tool for analysing large-scale FHIR R4 datasets to understand structure, completeness, and value distributions — without requiring full data flattening.
 
+For a detailed technical explanation of the tool's design, analysis logic, and output format, see the [Technical Documentation](FHIRScan_Technische_Dokumentation.pdf).
+
 ---
 
 ## Features
