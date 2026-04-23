@@ -107,6 +107,13 @@ FHIRScan/
 
 ---
 
+## Test Data
+
+Developed and tested with the MII FHIR test data from the Medizininformatik-Initiative:
+[kerndatensatz-testdaten](https://github.com/medizininformatik-initiative/kerndatensatz-testdaten/tree/master)
+
+---
+
 ## Relational Profiling Dimensions
 
 The relational analysis module covers five dimensions:
