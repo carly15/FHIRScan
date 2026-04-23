@@ -38,3 +38,16 @@ python fhir_profiler.py \
 
 # Quiet mode (no progress output)
 python fhir_profiler.py -q /data/fhir ./output
+
+
+fhir_profiler/
+├── __init__.py
+├── main.py              # Entry point
+├── config.py            # Configuration settings
+├── file_scanner.py      # Directory traversal and file discovery
+├── bundle_parser.py     # FHIR Bundle extraction
+├── path_traverser.py    # Recursive JSON path traversal
+├── statistics.py        # HyperLogLog and statistics accumulation
+├── aggregator.py        # Cross-file aggregation by resource type
+├── exporter.py          # CSV export
+└── utils.py             # Helpers
