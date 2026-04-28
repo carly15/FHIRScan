@@ -1,13 +1,40 @@
 #!/usr/bin/env python3
 """
-FHIR Dataset Profiler - Enhanced Version with Relational Analysis
+FHIRscan — FHIR Dataset Profiler
+=================================
 
-Adds:
-- Cardinality analysis (resources per patient/encounter)
-- Reference integrity checking
-- Temporal analysis
-- Structural depth metrics
-- Data quality scoring
+Analysiert FHIR-Datensatze (HL7 FHIR R4B) im JSON- und NDJSON-Format und erstellt
+ein umfassendes statistisches Profil uber alle enthaltenen Ressourcen und Felder.
+
+Funktionsweise
+--------------
+1. **Einlesen**: Liest FHIR-Bundles rekursiv aus einem Eingabeverzeichnis (JSON/NDJSON).
+2. **Extraktion**: Extrahiert einzelne Ressourcen und gruppiert sie nach `resourceType`
+   (z. B. Patient, Encounter, Observation).
+3. **Feldtraversierung**: Traversiert jeden Ressourceneintrag rekursiv und generiert
+   vollstandige Feldpfade (z. B. `subject.reference`, `code.coding[].system`).
+4. **Statistiken**: Akkumuliert je Feldpfad und Ressourcentyp:
+   - Vorkommen und Fullstandigkeit (presence rate)
+   - Datentypen (FHIR R4B-spezifisch: CodeableConcept, Reference, Period, ...)
+   - Werteverteilung (Top-N-Werte, Kardinalitat via HyperLogLog)
+   - Numerische Kennzahlen (Min, Max, Mittelwert, Standardabweichung)
+5. **Relationale Analyse**:
+   - Kardinalitaten (Ressourcen je Patient / Encounter)
+   - Referenzintegritat (dangling references)
+   - Zeitliche Verteilung der Ressourcen
+   - Strukturtiefe und Komplexitatsmetriken
+   - Data Quality Score je Ressourcentyp
+6. **Export**: Schreibt die Ergebnisse als CSV-Dateien in das Ausgabeverzeichnis.
+
+Verwendung
+----------
+    python main.py <input_dir> <output_dir> [Optionen]
+
+Optionen
+--------
+    --top-values N        Anzahl der haufigsten Werte je Feld (Standard: 20)
+    --no-relations        Relationale Analyse deaktivieren
+    --quiet               Keine Fortschrittsausgabe
 """
 
 import sys
