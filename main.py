@@ -35,6 +35,31 @@ Optionen
     --top-values N        Anzahl der haufigsten Werte je Feld (Standard: 20)
     --no-relations        Relationale Analyse deaktivieren
     --quiet               Keine Fortschrittsausgabe
+
+Contents
+--------
+To jump to a section, search (Ctrl/Cmd+F) for the heading text shown below.
+Named classes and functions are also listed in your IDE's Outline/Structure panel.
+
+    main.py
+    ├── CONFIGURATION ──────── ProfilerConfig
+    ├── UTILITIES ──────────── safe_json_load · get_python_type
+    ├── FHIR R4B TYPE DETECTION  detect_fhir_type · parse_fhir_reference
+    │                            parse_fhir_datetime
+    ├── HYPERLOGLOG ────────── HyperLogLog
+    ├── FIELD STATISTICS ───── FieldStatistics · ResourceTypeStatistics
+    ├── RELATIONAL STATISTICS  CardinalityStats · ReferenceInfo · TemporalInfo
+    │                          RelationalAnalyzer
+    ├── FILE SCANNING ──────── ScanResult · scan_directory
+    ├── BUNDLE PARSING ─────── extract_resources_from_bundle
+    │                          extract_resources_from_file
+    ├── PATH TRAVERSAL ─────── traverse_resource
+    ├── AGGREGATOR ─────────── Aggregator
+    ├── EXPORT FUNCTIONS ───── export_resource_type_csv · export_cardinality_csv
+    │                          export_data_quality_csv · export_summary_csv
+    │                          export_summary_details_csv · export_all_results
+    ├── MAIN PROFILER ──────── run_profiler
+    └── CLI ENTRY POINT ────── main()
 """
 
 import sys
@@ -141,9 +166,9 @@ _RE_DATE     = re.compile(r'^\d{4}(?:-\d{2}(?:-\d{2})?)?$')
 _RE_TIME     = re.compile(r'^\d{2}:\d{2}:\d{2}(?:\.\d+)?$')
 _RE_OID      = re.compile(r'^urn:oid:[\d.]+$')
 _RE_UUID     = re.compile(r'^urn:uuid:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
-_RE_URI      = re.compile(r'^[a-zA-Z][a-zA-Z0-9+\-.]*:')
+_RE_URI      = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.-]*:')
 _RE_BASE64   = re.compile(r'^[A-Za-z0-9+/]*={0,2}$')
-_RE_ID       = re.compile(r'^[A-Za-z0-9\-\.]{1,64}$')
+_RE_ID       = re.compile(r'^[A-Za-z0-9.-]{1,64}$')
 
 # ContactPoint.system values (FHIR bound ValueSet — R4B §4.6.4)
 _CONTACT_POINT_SYSTEMS: Set[str] = {'phone', 'fax', 'email', 'pager', 'url', 'sms', 'other'}
@@ -445,14 +470,14 @@ def detect_fhir_type(value: Any, field_name: str) -> str:
         # Disambiguate integer subtypes by field-name convention
         if field_name in ('count', 'frequency', 'frequencyMax', 'durationMax', 'periodMax'):
             return 'positiveInt'
-        if field_name in ('offset',):
+        if field_name == 'offset':
             return 'unsignedInt'
         return 'integer'
 
     if isinstance(value, dict):
-        result = _fingerprint_dict(value)
-        if result:
-            return result
+        fhir_type = _fingerprint_dict(value)
+        if fhir_type:
+            return fhir_type
         # Fall through to Layer 2 when fingerprint is inconclusive
 
     if isinstance(value, str):
@@ -476,7 +501,7 @@ def parse_fhir_reference(reference: str) -> Tuple[Optional[str], Optional[str]]:
     Handles formats:
     - "Patient/123"
     - "urn:uuid:abc-def"
-    - "[example.org](http://example.org/fhir/Patient/123)"
+    - "https://example.org/fhir/Patient/123"
     """
     if not reference:
         return None, None
@@ -554,13 +579,15 @@ class HyperLogLog:
         else:
             self.alpha = 0.7213 / (1 + 1.079 / self.m)
 
-    def _hash(self, value: Any) -> int:
+    @staticmethod
+    def _hash(value: Any) -> int:
         # Produce a 64-bit integer hash from any value via SHA-256 (first 8 bytes)
         str_repr = str(value).encode('utf-8')
         hash_bytes = hashlib.sha256(str_repr).digest()[:8]
         return int.from_bytes(hash_bytes, 'big')
 
-    def _leading_zeros(self, value: int, max_bits: int = 64) -> int:
+    @staticmethod
+    def _leading_zeros(value: int, max_bits: int = 64) -> int:
         # Count leading zero bits within a max_bits-wide integer
         # Used to compute the "rank" (position of the first 1-bit)
         if value == 0:
@@ -617,7 +644,6 @@ class FieldStatistics:
     hll_threshold: int = 10000
     top_n: int = 20
     max_value_length: int = 200
-    using_hll: bool = False                # True once we've switched from exact set to HLL
     fhir_types: Counter = field(default_factory=Counter)  # detected FHIR complex type(s) when field is an object
 
     def add_value(self, value: Any, python_type: str) -> None:
@@ -631,9 +657,10 @@ class FieldStatistics:
 
         self.value_counter[str_value] += 1  # for top-N most frequent values
 
-        if self.using_hll:
+        if self.hll is not None:
             self.hll.add(str_value)
         else:
+            assert self.exact_values is not None  # exact_values is cleared only when hll is set
             self.exact_values.add(str_value)
             # Once distinct values exceed the threshold, switch to approximate counting
             if len(self.exact_values) > self.hll_threshold:
@@ -641,24 +668,24 @@ class FieldStatistics:
 
     def _switch_to_hll(self) -> None:
         # Migrate all exact values into a HyperLogLog, then free the set
+        assert self.exact_values is not None
         self.hll = HyperLogLog(self.hll_precision)
         for val in self.exact_values:
             self.hll.add(val)
         self.exact_values = None  # release memory
-        self.using_hll = True
 
     def mark_resource_presence(self) -> None:
         self.resource_count += 1
 
     @property
     def unique_count(self) -> int:
-        if self.using_hll:
+        if self.hll is not None:
             return self.hll.count()
-        return len(self.exact_values) if self.exact_values else 0
+        return len(self.exact_values) if self.exact_values is not None else 0
 
     @property
     def unique_count_approximate(self) -> bool:
-        return self.using_hll
+        return self.hll is not None
 
     @property
     def top_values(self) -> List[tuple]:
@@ -1903,8 +1930,8 @@ Examples:
         verbose=not args.quiet
     )
 
-    result = run_profiler(config)
-    sys.exit(0 if result.get('error') is None else 1)
+    outcome = run_profiler(config)
+    sys.exit(0 if outcome.get('error') is None else 1)
 
 
 if __name__ == '__main__':
