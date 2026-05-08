@@ -4,7 +4,7 @@ FHIRscan — FHIR Dataset Profiler
 =================================
 
 Analysiert FHIR-Datensatze (HL7 FHIR R4B) im JSON- und NDJSON-Format und erstellt
-ein umfassendes statistisches Profil uber alle enthaltenen Ressourcen und Felder.
+ein umfassendes statistisches Profil über alle enthaltenen Ressourcen und Felder.
 
 Funktionsweise
 --------------
@@ -12,14 +12,14 @@ Funktionsweise
 2. **Extraktion**: Extrahiert einzelne Ressourcen und gruppiert sie nach `resourceType`
    (z. B. Patient, Encounter, Observation).
 3. **Feldtraversierung**: Traversiert jeden Ressourceneintrag rekursiv und generiert
-   vollstandige Feldpfade (z. B. `subject.reference`, `code.coding[].system`).
+   vollständige Feldpfade (z. B. `subject.reference`, `code.coding[].system`).
 4. **Statistiken**: Akkumuliert je Feldpfad und Ressourcentyp:
-   - Vorkommen und Fullstandigkeit (presence rate)
+   - Vorkommen und Vollständigkeit (presence rate)
    - Datentypen (FHIR R4B-spezifisch: CodeableConcept, Reference, Period, ...)
    - Werteverteilung (Top-N-Werte, Kardinalitat via HyperLogLog)
    - Numerische Kennzahlen (Min, Max, Mittelwert, Standardabweichung)
 5. **Relationale Analyse**:
-   - Kardinalitaten (Ressourcen je Patient / Encounter)
+   - Kardinalitäten (Ressourcen je Patient / Encounter)
    - Referenzintegritat (dangling references)
    - Zeitliche Verteilung der Ressourcen
    - Strukturtiefe und Komplexitatsmetriken
@@ -38,7 +38,6 @@ Optionen
 """
 
 import sys
-import os
 import time
 import json
 import csv
@@ -50,7 +49,7 @@ from pathlib import Path
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple
-from datetime import datetime, date
+from datetime import datetime
 import statistics
 
 
@@ -117,13 +116,13 @@ def get_python_type(value: Any) -> str:
     if isinstance(value, int):
         return "integer"
     if isinstance(value, float):
-        return "number"
+        return "float"
     if isinstance(value, str):
         return "string"
     if isinstance(value, list):
-        return "array"
+        return "list"
     if isinstance(value, dict):
-        return "object"
+        return "dictionary"
     return type(value).__name__
 
 
@@ -523,7 +522,7 @@ def parse_fhir_datetime(value: str) -> Optional[datetime]:
 
     for fmt in formats:
         try:
-            return datetime.strptime(value_clean[:len(value_clean)], fmt)
+            return datetime.strptime(value_clean, fmt)
         except ValueError:
             continue
 
@@ -600,7 +599,7 @@ class HyperLogLog:
 
 
 # =============================================================================
-# FIELD STATISTICS (from original)
+# FIELD STATISTICS
 # =============================================================================
 
 @dataclass
@@ -624,10 +623,6 @@ class FieldStatistics:
     def add_value(self, value: Any, python_type: str) -> None:
         self.value_count += 1
         self.types_seen[python_type] += 1
-
-        # Arrays and objects are counted for type tracking but their contents aren't stored as values
-        if python_type in ('array', 'object'):
-            return
 
         str_value = str(value)
         # Truncate very long values to avoid excessive memory use
@@ -714,7 +709,7 @@ class ResourceTypeStatistics:
 
 
 # =============================================================================
-# RELATIONAL STATISTICS (NEW)
+# RELATIONAL STATISTICS
 # =============================================================================
 
 @dataclass
@@ -754,7 +749,7 @@ class CardinalityStats:
         return statistics.stdev(self.counts) if len(self.counts) > 1 else 0.0
 
     def percentile(self, p: int) -> float:
-        """Calculate percentile (0-100)."""
+        """Calculate a single percentile (0–100)."""
         if not self.counts:
             return 0.0
         sorted_counts = sorted(self.counts)
@@ -762,7 +757,16 @@ class CardinalityStats:
         # Clamp index to last valid position (guards against p=100 going out of bounds)
         return sorted_counts[min(idx, len(sorted_counts) - 1)]
 
+    def percentiles(self, *ps: int) -> Dict[int, float]:
+        """Calculate multiple percentiles in one sort — use when calling several at once."""
+        if not self.counts:
+            return {p: 0.0 for p in ps}
+        sorted_counts = sorted(self.counts)
+        n = len(sorted_counts)
+        return {p: sorted_counts[min(int(n * p / 100), n - 1)] for p in ps}
+
     def to_dict(self) -> Dict[str, Any]:
+        pcts = self.percentiles(25, 75, 90, 99)
         return {
             'total_anchors': self.total_anchors,
             'total_resources': self.total_resources,
@@ -771,10 +775,10 @@ class CardinalityStats:
             'mean': round(self.mean_count, 2),
             'median': self.median_count,
             'std_dev': round(self.std_dev, 2),
-            'p25': self.percentile(25),
-            'p75': self.percentile(75),
-            'p90': self.percentile(90),
-            'p99': self.percentile(99)
+            'p25': pcts[25],
+            'p75': pcts[75],
+            'p90': pcts[90],
+            'p99': pcts[99],
         }
 
 
@@ -978,43 +982,29 @@ class RelationalAnalyzer:
         self.extract_temporal(resource)
         self.track_structural_depth(resource)
 
-    def compute_cardinality_stats(self) -> Dict[str, Dict[str, CardinalityStats]]:
+    def compute_cardinality_stats(self) -> Dict[str, Dict[str, 'CardinalityStats']]:
         """Compute cardinality statistics per resource type per anchor."""
-        results = {}
+        results: Dict[str, Dict[str, CardinalityStats]] = {}
 
-        # Per Patient cardinality
+        def _build_stats(counts_by_anchor: Dict[str, int]) -> CardinalityStats:
+            stats = CardinalityStats()
+            for count in counts_by_anchor.values():
+                stats.add(count)
+            return stats
+
         for resource_type, patient_counts in self.cardinality_by_patient.items():
-            if resource_type not in results:
-                results[resource_type] = {}
+            results.setdefault(resource_type, {})['per_patient'] = _build_stats(patient_counts)
 
-            stats = CardinalityStats()
-            for patient_id, count in patient_counts.items():
-                stats.add(count)
-
-            results[resource_type]['per_patient'] = stats
-
-        # Per Encounter cardinality
         for resource_type, encounter_counts in self.cardinality_by_encounter.items():
-            if resource_type not in results:
-                results[resource_type] = {}
+            results.setdefault(resource_type, {})['per_encounter'] = _build_stats(encounter_counts)
 
-            stats = CardinalityStats()
-            for encounter_id, count in encounter_counts.items():
-                stats.add(count)
-
-            results[resource_type]['per_encounter'] = stats
-
-        # Encounters per Patient
-        encounters_per_patient = Counter()
-        for encounter_id, patient_id in self.encounter_to_patient.items():
+        # Encounters per Patient (derived from the encounter→patient mapping)
+        encounters_per_patient: Counter = Counter()
+        for patient_id in self.encounter_to_patient.values():
             encounters_per_patient[patient_id] += 1
 
         if encounters_per_patient:
-            stats = CardinalityStats()
-            for patient_id, count in encounters_per_patient.items():
-                stats.add(count)
-            results['Encounter'] = results.get('Encounter', {})
-            results['Encounter']['per_patient'] = stats
+            results.setdefault('Encounter', {})['per_patient'] = _build_stats(dict(encounters_per_patient))
 
         return results
 
@@ -1301,43 +1291,36 @@ def traverse_resource(
 # AGGREGATOR
 # =============================================================================
 
-@dataclass
-class AggregationState:
-    """Current state of aggregation."""
-    resource_types: Dict[str, ResourceTypeStatistics] = field(default_factory=dict)
-    files_processed: int = 0
-    total_resources: int = 0
-    errors: List[str] = field(default_factory=list)
-    config: Optional[ProfilerConfig] = None
-    relational: RelationalAnalyzer = field(default_factory=RelationalAnalyzer)
-    # Tracks (resourceType, id) pairs already processed to prevent double-counting
-    # resources that appear in multiple patient bundles (e.g. shared Medication records)
-    seen_resource_ids: Set[Tuple[str, str]] = field(default_factory=set)
-
-    def get_or_create_resource_type(self, resource_type: str) -> ResourceTypeStatistics:
-        if resource_type not in self.resource_types:
-            self.resource_types[resource_type] = ResourceTypeStatistics(
-                resource_type=resource_type,
-                hll_precision=self.config.hll_precision if self.config else 14,
-                hll_threshold=self.config.hll_threshold if self.config else 10000,
-                top_n=self.config.top_values_limit if self.config else 20,
-                max_value_length=self.config.max_value_length if self.config else 200
-            )
-        return self.resource_types[resource_type]
-
-
 class Aggregator:
     """Main aggregation engine."""
 
     def __init__(self, config: ProfilerConfig):
         self.config = config
-        self.state = AggregationState(config=config)
+        self.resource_types: Dict[str, ResourceTypeStatistics] = {}
+        self.files_processed: int = 0
+        self.total_resources: int = 0
+        self.errors: List[str] = []
+        self.relational = RelationalAnalyzer()
+        # Tracks (resourceType, id) pairs already processed to prevent double-counting
+        # resources that appear in multiple patient bundles (e.g. shared Medication records)
+        self.seen_resource_ids: Set[Tuple[str, str]] = set()
+
+    def _get_or_create_resource_type(self, resource_type: str) -> ResourceTypeStatistics:
+        if resource_type not in self.resource_types:
+            self.resource_types[resource_type] = ResourceTypeStatistics(
+                resource_type=resource_type,
+                hll_precision=self.config.hll_precision,
+                hll_threshold=self.config.hll_threshold,
+                top_n=self.config.top_values_limit,
+                max_value_length=self.config.max_value_length
+            )
+        return self.resource_types[resource_type]
 
     def process_resource(self, resource: Dict[str, Any]) -> None:
         resource_type = resource.get('resourceType')
 
         if not resource_type:
-            self.state.errors.append("Resource without resourceType encountered")
+            self.errors.append("Resource without resourceType encountered")
             return
 
         # Deduplicate by (resourceType, id): the same resource can appear in multiple
@@ -1346,16 +1329,16 @@ class Aggregator:
         resource_id = resource.get('id')
         if resource_id:
             dedup_key = (resource_type, resource_id)
-            if dedup_key in self.state.seen_resource_ids:
+            if dedup_key in self.seen_resource_ids:
                 return
-            self.state.seen_resource_ids.add(dedup_key)
+            self.seen_resource_ids.add(dedup_key)
 
-        type_stats = self.state.get_or_create_resource_type(resource_type)
+        type_stats = self._get_or_create_resource_type(resource_type)
         type_stats.increment_resource_count()
-        self.state.total_resources += 1
+        self.total_resources += 1
 
         # Field-level profiling
-        paths_seen_in_resource = set()
+        paths_seen_in_resource: Set[str] = set()
 
         for path, value, python_type, is_first_in_resource in traverse_resource(
                 resource,
@@ -1386,7 +1369,7 @@ class Aggregator:
 
         # Relational analysis
         if self.config.analyze_relations:
-            self.state.relational.analyze_resource(resource)
+            self.relational.analyze_resource(resource)
 
     def process_resources(self, resources: List[Dict[str, Any]]) -> None:
         for resource in resources:
@@ -1395,28 +1378,28 @@ class Aggregator:
             except Exception as e:
                 resource_type = resource.get('resourceType', 'Unknown')
                 resource_id = resource.get('id', 'no-id')
-                self.state.errors.append(f"Error processing {resource_type}/{resource_id}: {e}")
+                self.errors.append(f"Error processing {resource_type}/{resource_id}: {e}")
 
     def mark_file_processed(self) -> None:
-        self.state.files_processed += 1
+        self.files_processed += 1
 
     def get_summary(self) -> Dict[str, Any]:
         return {
-            'files_processed': self.state.files_processed,
-            'total_resources': self.state.total_resources,
-            'resource_types': list(self.state.resource_types.keys()),
+            'files_processed': self.files_processed,
+            'total_resources': self.total_resources,
+            'resource_types': list(self.resource_types.keys()),
             'resource_type_counts': {
                 rt: stats.total_resources
-                for rt, stats in self.state.resource_types.items()
+                for rt, stats in self.resource_types.items()
             },
-            'error_count': len(self.state.errors)
+            'error_count': len(self.errors)
         }
 
     def get_results(self) -> Dict[str, ResourceTypeStatistics]:
-        return self.state.resource_types
+        return self.resource_types
 
     def get_relational_results(self) -> RelationalAnalyzer:
-        return self.state.relational
+        return self.relational
 
 
 # =============================================================================
@@ -1519,6 +1502,9 @@ def export_cardinality_csv(
                     if total_in_dataset > 0 else 0.0
                 )
 
+                # Compute all percentiles in one sort pass
+                pcts = stats.percentiles(25, 75, 90, 99)
+
                 # Build the row explicitly — avoids any key collision from to_dict()
                 # coverage_rate is formatted as a fixed 4-decimal string so spreadsheets
                 # with European locale don't misread e.g. "0.377" as the integer 377
@@ -1534,10 +1520,10 @@ def export_cardinality_csv(
                     'mean': round(stats.mean_count, 2),
                     'median': stats.median_count,
                     'std_dev': round(stats.std_dev, 2),
-                    'p25': stats.percentile(25),
-                    'p75': stats.percentile(75),
-                    'p90': stats.percentile(90),
-                    'p99': stats.percentile(99),
+                    'p25': pcts[25],
+                    'p75': pcts[75],
+                    'p90': pcts[90],
+                    'p99': pcts[99],
                 })
 
     return output_file
@@ -1591,51 +1577,14 @@ def _format_as_text(data: Any, indent: int = 0) -> str:
     return "\n".join(lines)
 
 
-def export_reference_integrity_txt(
-        integrity_stats: Dict[str, Any],
-        output_dir: Path
-) -> Path:
-    """Export reference integrity analysis as plain text."""
-    output_file = output_dir / "_reference_integrity.txt"
-
+def _export_analysis_txt(title: str, data: Any, filename: str, output_dir: Path) -> Path:
+    """Write a titled plain-text analysis report."""
+    output_file = output_dir / filename
     with open(output_file, 'w', encoding='utf-8') as f:
-        f.write("REFERENCE INTEGRITY ANALYSIS\n")
+        f.write(f"{title}\n")
         f.write("=" * 40 + "\n\n")
-        f.write(_format_as_text(integrity_stats))
+        f.write(_format_as_text(data))
         f.write("\n")
-
-    return output_file
-
-
-def export_temporal_txt(
-        temporal_stats: Dict[str, Any],
-        output_dir: Path
-) -> Path:
-    """Export temporal analysis as plain text."""
-    output_file = output_dir / "_temporal_analysis.txt"
-
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write("TEMPORAL ANALYSIS\n")
-        f.write("=" * 40 + "\n\n")
-        f.write(_format_as_text(temporal_stats))
-        f.write("\n")
-
-    return output_file
-
-
-def export_structural_txt(
-        structural_stats: Dict[str, Any],
-        output_dir: Path
-) -> Path:
-    """Export structural depth analysis as plain text."""
-    output_file = output_dir / "_structural_analysis.txt"
-
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write("STRUCTURAL DEPTH ANALYSIS\n")
-        f.write("=" * 40 + "\n\n")
-        f.write(_format_as_text(structural_stats))
-        f.write("\n")
-
     return output_file
 
 
@@ -1790,19 +1739,25 @@ def export_all_results(
 
     # Reference integrity
     integrity = relational.compute_reference_integrity()
-    output_files['_reference_integrity'] = export_reference_integrity_txt(integrity, output_dir)
+    output_files['_reference_integrity'] = _export_analysis_txt(
+        "REFERENCE INTEGRITY ANALYSIS", integrity, "_reference_integrity.txt", output_dir
+    )
     if verbose:
         print(f"  Reference integrity: {integrity['total_references']} references analysed")
 
     # Temporal analysis
     temporal = relational.compute_temporal_stats()
-    output_files['_temporal'] = export_temporal_txt(temporal, output_dir)
+    output_files['_temporal'] = _export_analysis_txt(
+        "TEMPORAL ANALYSIS", temporal, "_temporal_analysis.txt", output_dir
+    )
     if verbose:
         print(f"  Temporal: {temporal['resources_with_dates']} dated resources")
 
     # Structural analysis
     structural = relational.compute_structural_stats()
-    output_files['_structural'] = export_structural_txt(structural, output_dir)
+    output_files['_structural'] = _export_analysis_txt(
+        "STRUCTURAL DEPTH ANALYSIS", structural, "_structural_analysis.txt", output_dir
+    )
     if verbose:
         print(f"  Structural depth: {len(structural['depth_by_type'])} resource types")
 
@@ -1813,25 +1768,14 @@ def export_all_results(
 # MAIN PROFILER
 # =============================================================================
 
-def run_profiler(
-        input_dir: Path,
-        output_dir: Path,
-        config: Optional[ProfilerConfig] = None,
-        verbose: bool = True
-) -> dict:
+def run_profiler(config: ProfilerConfig) -> dict:
     """Run the FHIR dataset profiler with relational analysis."""
     start_time = time.time()
     # Capture timestamp at the moment extraction begins; used to name the output subfolder
     run_timestamp = datetime.now().strftime("%Y%m%d_%H_%M")
+    verbose = config.verbose
 
-    if config is None:
-        config = ProfilerConfig(
-            input_dir=input_dir,
-            output_dir=output_dir,
-            verbose=verbose
-        )
-
-    # All output goes into a timestamped subfolder (e.g. Output/2026-04-09_14-30-00/)
+    # All output goes into a timestamped subfolder (e.g. Output/20260509_14_30/)
     timestamped_output_dir = config.output_dir / run_timestamp
     timestamped_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1893,7 +1837,7 @@ def run_profiler(
     output_files = export_all_results(results, relational, timestamped_output_dir, verbose)
 
     # Write errors
-    all_errors = aggregator.state.errors + extraction_errors + scan_result.scan_errors
+    all_errors = aggregator.errors + extraction_errors + scan_result.scan_errors
     if all_errors:
         error_file = timestamped_output_dir / "_errors.txt"
         with open(error_file, 'w', encoding='utf-8') as f:
@@ -1959,21 +1903,17 @@ Examples:
         verbose=not args.quiet
     )
 
-    result = run_profiler(args.input_dir, args.output_dir, config, not args.quiet)
+    result = run_profiler(config)
     sys.exit(0 if result.get('error') is None else 1)
 
 
 if __name__ == '__main__':
     # For quick testing - hardcode your paths here
-    from pathlib import Path
-
     INPUT_DIR = Path("/Users/carlabhc/Documents/Test FHIR Data")  # ← Change this when necessary
     OUTPUT_DIR = Path("/Users/carlabhc/Documents/Python Projects/FHIR_Dataset_Profiling/Output")  # ← Change this when necessary
 
     result = run_profiler(
-        input_dir=INPUT_DIR,
-        output_dir=OUTPUT_DIR,
-        verbose=True
+        ProfilerConfig(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, verbose=True)
     )
 
     print(f"\nResults: {result}")
