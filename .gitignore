@@ -17,5 +17,8 @@ Output/
 # IDE (PyCharm)
 .idea/
 
+# Jupyter notebooks
+.ipynb_checkpoints/
+
 # Claude Code local config
 .claude/
