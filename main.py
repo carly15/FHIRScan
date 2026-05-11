@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+DEPRECATED — use profiler_file.py instead.
+This file is kept for reference only and will not be maintained.
+=================================
 FHIRscan — FHIR Dataset Profiler
 =================================
 
