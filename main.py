@@ -1142,29 +1142,19 @@ def extract_resources_from_bundle(bundle: Dict[str, Any]) -> Generator[Dict[str,
         yield bundle
 
 
-def extract_resources_from_file(file_path: Path) -> Tuple[List[Dict], int, List[str]]:
-    """Extract all resources from a JSON/NDJSON file."""
-    resources = []
-    bundle_count = 0
-    errors = []
-
+def extract_resources_from_file(
+        file_path: Path,
+        errors: List[str]
+) -> Generator[Dict, None, None]:
+    """Stream resources one by one from a JSON/NDJSON file."""
     try:
         for obj in safe_json_load(file_path):
             if not isinstance(obj, dict):
                 errors.append(f"Non-object JSON element in {file_path}")
                 continue
-
-            resource_type = obj.get('resourceType')
-            if resource_type == 'Bundle':
-                bundle_count += 1
-
-            for resource in extract_resources_from_bundle(obj):
-                resources.append(resource)
-
+            yield from extract_resources_from_bundle(obj)
     except Exception as e:
         errors.append(f"Error processing {file_path}: {e}")
-
-    return resources, bundle_count, errors
 
 
 # =============================================================================
@@ -1791,9 +1781,8 @@ def run_profiler(config: ProfilerConfig) -> dict:
 
     for idx, file_path in enumerate(scan_result.files, 1):
         try:
-            resources, bundle_count, errors = extract_resources_from_file(file_path)
-            extraction_errors.extend(errors)
-            aggregator.process_resources(resources)
+            for resource in extract_resources_from_file(file_path, extraction_errors):
+                aggregator.process_resource(resource)
             aggregator.mark_file_processed()
 
             if verbose and (idx % 50 == 0 or idx == total_files):
