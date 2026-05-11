@@ -16,13 +16,13 @@ Funktionsweise
 4. **Statistiken**: Akkumuliert je Feldpfad und Ressourcentyp:
    - Vorkommen und Vollständigkeit (presence rate)
    - Datentypen (FHIR R4B-spezifisch: CodeableConcept, Reference, Period, ...)
-   - Werteverteilung (Top-N-Werte, Kardinalitat via HyperLogLog)
+   - Werteverteilung (Top-N-Werte, Kardinalität via HyperLogLog)
    - Numerische Kennzahlen (Min, Max, Mittelwert, Standardabweichung)
 5. **Relationale Analyse**:
    - Kardinalitäten (Ressourcen je Patient / Encounter)
-   - Referenzintegritat (dangling references)
+   - Referenzintegrität (dangling references)
    - Zeitliche Verteilung der Ressourcen
-   - Strukturtiefe und Komplexitatsmetriken
+   - Strukturtiefe und Komplexitätsmetriken
    - Data Quality Score je Ressourcentyp
 6. **Export**: Schreibt die Ergebnisse als CSV-Dateien in das Ausgabeverzeichnis.
 
@@ -32,7 +32,7 @@ Verwendung
 
 Optionen
 --------
-    --top-values N        Anzahl der haufigsten Werte je Feld (Standard: 20)
+    --top-values N        Anzahl der häufigsten Werte je Feld (Standard: 20)
     --no-relations        Relationale Analyse deaktivieren
     --quiet               Keine Fortschrittsausgabe
 
@@ -870,64 +870,6 @@ class RelationalAnalyzer:
         if resource_type and resource_id:
             self.known_ids[resource_type].add(resource_id)
 
-    def extract_references(self, resource: Dict[str, Any]) -> None:
-        """Extract all references from a resource."""
-        resource_type = resource.get('resourceType', 'Unknown')
-        resource_id = resource.get('id', 'unknown')
-
-        patient_ref = None
-        encounter_ref = None
-
-        def _find_references(obj: Any, path: str = ""):
-            nonlocal patient_ref, encounter_ref  # updated as we find Patient/Encounter links while walking the tree
-
-            if isinstance(obj, dict):
-                # Check for reference field
-                if 'reference' in obj:
-                    ref_value = obj['reference']
-                    target_type, target_id = parse_fhir_reference(ref_value)
-
-                    self.references.append(ReferenceInfo(
-                        source_type=resource_type,
-                        source_id=resource_id,
-                        reference_path=path,
-                        target_type=target_type,
-                        target_id=target_id,
-                        raw_reference=ref_value
-                    ))
-
-                    # Track patient and encounter references
-                    if target_type == 'Patient':
-                        patient_ref = target_id
-                    elif target_type == 'Encounter':
-                        encounter_ref = target_id
-
-                # Recurse into object
-                for key, value in obj.items():
-                    child_path = f"{path}.{key}" if path else key
-                    _find_references(value, child_path)
-
-            elif isinstance(obj, list):
-                for i, item in enumerate(obj):
-                    _find_references(item, f"{path}[]")
-
-        _find_references(resource)
-
-        # Update cardinality tracking
-        if patient_ref:
-            self.cardinality_by_patient[resource_type][patient_ref] += 1
-            self.resources_with_patient_ref[resource_type] += 1
-        else:
-            self.resources_without_patient_ref[resource_type] += 1
-
-        if encounter_ref:
-            self.cardinality_by_encounter[resource_type][encounter_ref] += 1
-            self.resources_with_encounter_ref[resource_type] += 1
-
-        # Track Encounter -> Patient mapping
-        if resource_type == 'Encounter' and patient_ref:
-            self.encounter_to_patient[resource_id] = patient_ref
-
     def extract_temporal(self, resource: Dict[str, Any]) -> None:
         """Extract temporal information from a resource."""
         resource_type = resource.get('resourceType', 'Unknown')
@@ -978,36 +920,6 @@ class RelationalAnalyzer:
                 period_end=period_end
             ))
 
-    def track_structural_depth(self, resource: Dict[str, Any]) -> None:
-        """Track structural depth and array sizes."""
-        resource_type = resource.get('resourceType', 'Unknown')
-
-        max_depth = 0
-
-        def _measure_depth(obj: Any, depth: int = 0):
-            nonlocal max_depth
-            max_depth = max(max_depth, depth)
-
-            if isinstance(obj, dict):
-                for value in obj.values():
-                    _measure_depth(value, depth + 1)
-            elif isinstance(obj, list):
-                # Track array size
-                path_key = f"{resource_type}_arrays"
-                self.array_sizes[path_key].append(len(obj))
-
-                for item in obj:
-                    _measure_depth(item, depth + 1)
-
-        _measure_depth(resource)
-        self.max_depths[resource_type].append(max_depth)
-
-    def analyze_resource(self, resource: Dict[str, Any]) -> None:
-        """Perform all relational analysis on a resource."""
-        self.register_resource(resource)
-        self.extract_references(resource)
-        self.extract_temporal(resource)
-        self.track_structural_depth(resource)
 
     def compute_cardinality_stats(self) -> Dict[str, Dict[str, 'CardinalityStats']]:
         """Compute cardinality statistics per resource type per anchor."""
@@ -1263,8 +1175,8 @@ def traverse_resource(
         resource: Dict[str, Any],
         inline_extensions: bool = True,
         max_depth: int = 50
-) -> Generator[Tuple[str, Any, str, bool], None, None]:
-    """Recursively traverse a FHIR resource."""
+) -> Generator[Tuple[str, Any, str, bool, int], None, None]:
+    """Recursively traverse a FHIR resource, yielding (path, value, type, is_first, depth)."""
     resource_type = resource.get('resourceType', 'Unknown')
     # Tracks every path seen in this resource; used to emit is_first=True only on first encounter
     paths_in_resource: Set[str] = set()
@@ -1275,7 +1187,7 @@ def traverse_resource(
 
         if isinstance(obj, dict):
             # Yield the object itself before recursing into its fields
-            yield (current_path, obj, 'object', current_path not in paths_in_resource)
+            yield (current_path, obj, 'object', current_path not in paths_in_resource, depth)
             paths_in_resource.add(current_path)
 
             if inline_extensions and 'extension' in obj:
@@ -1299,7 +1211,7 @@ def traverse_resource(
         elif isinstance(obj, list):
             # All array items share the same path with a '[]' suffix (type-agnostic)
             array_path = current_path + '[]'
-            yield (array_path, obj, 'array', array_path not in paths_in_resource)
+            yield (array_path, obj, 'array', array_path not in paths_in_resource, depth)
             paths_in_resource.add(array_path)
 
             for item in obj:
@@ -1309,7 +1221,7 @@ def traverse_resource(
             # Scalar value (string, number, boolean, null)
             is_first = current_path not in paths_in_resource  # True only on first occurrence in this resource
             paths_in_resource.add(current_path)
-            yield (current_path, obj, get_python_type(obj), is_first)
+            yield (current_path, obj, get_python_type(obj), is_first, depth)
 
     yield from _traverse(resource, resource_type)
 
@@ -1364,13 +1276,20 @@ class Aggregator:
         type_stats.increment_resource_count()
         self.total_resources += 1
 
-        # Field-level profiling
         paths_seen_in_resource: Set[str] = set()
+        analyze = self.config.analyze_relations
+        # Relational state accumulated across the single traversal pass
+        local_patient_ref: Optional[str] = None
+        local_encounter_ref: Optional[str] = None
+        resource_max_depth: int = 0
+        # prefix length used to strip "ResourceType." from paths for reference_path storage
+        rt_prefix_len = len(resource_type) + 1
 
-        for path, value, python_type, is_first_in_resource in traverse_resource(
+        for path, value, python_type, is_first_in_resource, depth in traverse_resource(
                 resource,
                 inline_extensions=self.config.inline_extensions
         ):
+            # ── field-level profiling ─────────────────────────────────────────
             field_stats = type_stats.get_or_create_field(path)
 
             if is_first_in_resource and path not in paths_seen_in_resource:
@@ -1394,9 +1313,51 @@ class Aggregator:
                 field_stats.types_seen[python_type] += 1
                 field_stats.value_count += 1
 
-        # Relational analysis
-        if self.config.analyze_relations:
-            self.relational.analyze_resource(resource)
+            if not analyze:
+                continue
+
+            # ── relational analysis (merged — no second/third traversal) ──────
+            resource_max_depth = max(resource_max_depth, depth)
+
+            if python_type == 'array':
+                self.relational.array_sizes[f"{resource_type}_arrays"].append(len(value))
+
+            elif python_type == 'object' and 'reference' in value:
+                ref_value = value['reference']
+                target_type, target_id = parse_fhir_reference(ref_value)
+                # Strip the leading "ResourceType." prefix to match the original path format
+                ref_path = path[rt_prefix_len:] if len(path) > rt_prefix_len else ''
+                self.relational.references.append(ReferenceInfo(
+                    source_type=resource_type,
+                    source_id=resource_id or 'unknown',
+                    reference_path=ref_path,
+                    target_type=target_type,
+                    target_id=target_id,
+                    raw_reference=ref_value
+                ))
+                if target_type == 'Patient':
+                    local_patient_ref = target_id
+                elif target_type == 'Encounter':
+                    local_encounter_ref = target_id
+
+        # ── post-traversal relational updates ─────────────────────────────────
+        if analyze:
+            self.relational.register_resource(resource)
+            self.relational.extract_temporal(resource)
+            self.relational.max_depths[resource_type].append(resource_max_depth)
+
+            if local_patient_ref:
+                self.relational.cardinality_by_patient[resource_type][local_patient_ref] += 1
+                self.relational.resources_with_patient_ref[resource_type] += 1
+            else:
+                self.relational.resources_without_patient_ref[resource_type] += 1
+
+            if local_encounter_ref:
+                self.relational.cardinality_by_encounter[resource_type][local_encounter_ref] += 1
+                self.relational.resources_with_encounter_ref[resource_type] += 1
+
+            if resource_type == 'Encounter' and local_patient_ref:
+                self.relational.encounter_to_patient[resource_id] = local_patient_ref
 
     def process_resources(self, resources: List[Dict[str, Any]]) -> None:
         for resource in resources:
