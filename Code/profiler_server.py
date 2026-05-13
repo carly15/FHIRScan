@@ -1624,13 +1624,14 @@ def _export_analysis_txt(title: str, data: Any, filename: str, output_dir: Path)
 
 def export_summary_csv(
         results: Dict[str, ResourceTypeStatistics],
-        output_dir: Path
+        output_dir: Path,
+        unique_patients: int = 0
 ) -> Path:
     """Export summary of all resource types."""
     output_file = output_dir / "_summary.csv"
 
     columns = [
-        'resource_type', 'total_resources', 'total_fields',
+        'resource_type', 'total_resources', 'avg_resources_per_patient', 'total_fields',
         'fields_always_present', 'fields_sometimes_present', 'fields_with_type_inconsistency'
     ]
 
@@ -1651,10 +1652,12 @@ def export_summary_csv(
                 1 for fs in stats.field_stats.values()
                 if fs.has_type_inconsistency
             )
+            avg = round(stats.total_resources / unique_patients, 1) if unique_patients > 0 else ''
 
             writer.writerow({
                 'resource_type': resource_type,
                 'total_resources': stats.total_resources,
+                'avg_resources_per_patient': avg,
                 'total_fields': len(stats.field_stats),
                 'fields_always_present': always_present,
                 'fields_sometimes_present': sometimes_present,
@@ -1750,7 +1753,8 @@ def export_all_results(
             print(f"  {resource_type}: {len(stats.field_stats)} fields")
 
     # Summary (counts) + detailed breakdown (field names per category)
-    output_files['_summary'] = export_summary_csv(results, output_dir)
+    unique_patients = len(relational.known_ids.get('Patient', set()))
+    output_files['_summary'] = export_summary_csv(results, output_dir, unique_patients)
     output_files['_summary_details'] = export_summary_details_csv(results, output_dir)
     if verbose:
         total_fields = sum(len(s.field_stats) for s in results.values())
