@@ -7,6 +7,11 @@ venv/
 
 # Profiler output (timestamped runs)
 Output/
+diz_comparison_results/
+
+# Non-code assets (docs, archives, legacy files)
+Stuff/
+*.zip
 
 # macOS
 .DS_Store
