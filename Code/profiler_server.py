@@ -1,38 +1,43 @@
 #!/usr/bin/env python3
 """
-FHIRscan — FHIR Dataset Profiler
-=================================
+FHIRscan — FHIR Server Profiler
+================================
 
-Analysiert FHIR-Datensatze (HL7 FHIR R4B) im JSON- und NDJSON-Format und erstellt
-ein umfassendes statistisches Profil über alle enthaltenen Ressourcen und Felder.
+Verbindet sich mit einem FHIR R4 Server (getestet auf Blaze) und erstellt
+ein umfassendes statistisches Profil über alle Patientenressourcen.
 
 Funktionsweise
 --------------
-1. **Einlesen**: Liest FHIR-Bundles rekursiv aus einem Eingabeverzeichnis (JSON/NDJSON).
-2. **Extraktion**: Extrahiert einzelne Ressourcen und gruppiert sie nach `resourceType`
-   (z. B. Patient, Encounter, Observation).
-3. **Feldtraversierung**: Traversiert jeden Ressourceneintrag rekursiv und generiert
-   vollständige Feldpfade (z. B. `subject.reference`, `code.coding[].system`).
-4. **Statistiken**: Akkumuliert je Feldpfad und Ressourcentyp:
+1. **Verbindungscheck**: Prüft den Server via GET /metadata und zeigt
+   Softwarename und FHIR-Version.
+2. **Patientenliste**: Liest alle Patienten-IDs paginiert via GET /Patient.
+3. **Ressourcenabruf**: Ruft für jeden Patienten alle verknüpften Ressourcen
+   via GET /Patient/[id]/$everything ab (paginiert, mit Retry-Logik).
+4. **Feldtraversierung**: Traversiert jeden Ressourceneintrag rekursiv und
+   generiert vollständige Feldpfade (z. B. `subject.reference`, `code.coding[].system`).
+5. **Statistiken**: Akkumuliert je Feldpfad und Ressourcentyp:
    - Vorkommen und Vollständigkeit (presence rate)
    - Datentypen (FHIR R4B-spezifisch: CodeableConcept, Reference, Period, ...)
    - Werteverteilung (Top-N-Werte, Kardinalität via HyperLogLog)
-   - Numerische Kennzahlen (Min, Max, Mittelwert, Standardabweichung)
-5. **Relationale Analyse**:
+6. **Relationale Analyse**:
    - Kardinalitäten (Ressourcen je Patient / Encounter)
    - Referenzintegrität (dangling references)
    - Zeitliche Verteilung der Ressourcen
    - Strukturtiefe und Komplexitätsmetriken
    - Data Quality Score je Ressourcentyp
-6. **Export**: Schreibt die Ergebnisse als CSV-Dateien in das Ausgabeverzeichnis.
+7. **Export**: Schreibt die Ergebnisse als CSV-Dateien in das Ausgabeverzeichnis.
 
 Verwendung
 ----------
-    python main.py <input_dir> <output_dir> [Optionen]
+    python profiler_server.py <server_url> <output_dir> [Optionen]
 
 Optionen
 --------
-    --top-values N        Anzahl der häufigsten Werte je Feld (Standard: 20)
+    --token TOKEN         Bearer-Token für Authentifizierung
+    --limit N             Nur die ersten N Patienten verarbeiten (Testlauf)
+    --request-delay SEC   Pause zwischen Patienten in Sekunden (Server schonen)
+    --max-retries N       Wiederholungsversuche bei Serverfehlern (Standard: 3)
+    --page-size N         Ressourcen pro Seite (Standard: 100)
     --no-relations        Relationale Analyse deaktivieren
     --quiet               Keine Fortschrittsausgabe
 
@@ -41,18 +46,18 @@ Contents
 To jump to a section, search (Ctrl/Cmd+F) for the heading text shown below.
 Named classes and functions are also listed in your IDE's Outline/Structure panel.
 
-    main.py
+    profiler_server.py
     ├── CONFIGURATION ──────── ProfilerConfig
-    ├── UTILITIES ──────────── safe_json_load · get_python_type
+    ├── UTILITIES ──────────── get_python_type
     ├── FHIR R4B TYPE DETECTION  detect_fhir_type · parse_fhir_reference
     │                            parse_fhir_datetime
     ├── HYPERLOGLOG ────────── HyperLogLog
     ├── FIELD STATISTICS ───── FieldStatistics · ResourceTypeStatistics
     ├── RELATIONAL STATISTICS  CardinalityStats · ReferenceInfo · TemporalInfo
     │                          RelationalAnalyzer
-    ├── FILE SCANNING ──────── ScanResult · scan_directory
-    ├── BUNDLE PARSING ─────── extract_resources_from_bundle
-    │                          extract_resources_from_file
+    ├── SERVER CONNECTION ──── make_session · check_server · _get_with_retry
+    │                          _follow_pages · fetch_patient_count
+    │                          fetch_patient_ids · fetch_patient_resources
     ├── PATH TRAVERSAL ─────── traverse_resource
     ├── AGGREGATOR ─────────── Aggregator
     ├── EXPORT FUNCTIONS ───── export_resource_type_csv · export_cardinality_csv
@@ -64,6 +69,7 @@ Named classes and functions are also listed in your IDE's Outline/Structure pane
 
 import sys
 import time
+import tracemalloc
 import json
 import csv
 import math
@@ -91,6 +97,9 @@ class ProfilerConfig:
     output_dir: Path
     auth_token: Optional[str] = None   # Bearer token; None for unauthenticated local servers
     page_size: int = 100               # resources per page for Patient and $everything queries
+    patient_limit: Optional[int] = None  # stop after N patients (None = all); for test runs
+    request_delay: float = 0.0          # seconds to wait between patients; use to avoid overloading the server
+    max_retries: int = 3                 # retry attempts for transient HTTP errors (429, 5xx)
     top_values_limit: int = 20
     max_value_length: int = 200
     hll_precision: int = 14
@@ -1091,11 +1100,65 @@ def make_session(auth_token: Optional[str] = None) -> requests.Session:
     return session
 
 
-def _follow_pages(session: requests.Session, url: str) -> Generator[Dict, None, None]:
+def check_server(session: requests.Session, base_url: str, verbose: bool = True) -> bool:
+    """Verify the server is reachable and speaks FHIR R4. Returns False on failure."""
+    if verbose:
+        print(f"Checking server: {base_url}/metadata")
+    try:
+        resp = session.get(f"{base_url}/metadata", timeout=15)
+        resp.raise_for_status()
+        cap = resp.json()
+        fhir_version = cap.get('fhirVersion', 'unknown')
+        if not fhir_version.startswith('4.'):
+            print(f"  Warning: server reports FHIR {fhir_version}, expected R4 (4.x)")
+        if verbose:
+            sw = cap.get('software', {})
+            print(f"  OK — {sw.get('name', 'Unknown')} {sw.get('version', '')} "
+                  f"(FHIR {fhir_version})")
+        return True
+    except requests.exceptions.ConnectionError:
+        print(f"  Error: cannot reach {base_url} — is the server running?")
+    except requests.exceptions.Timeout:
+        print(f"  Error: server timed out on /metadata")
+    except requests.exceptions.HTTPError as e:
+        print(f"  Error: server returned HTTP {e.response.status_code} for /metadata")
+    except Exception as e:
+        print(f"  Error: {e}")
+    return False
+
+
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _get_with_retry(
+        session: requests.Session,
+        url: str,
+        max_retries: int = 3,
+        timeout: int = 60
+) -> requests.Response:
+    """GET with exponential backoff for transient server errors (429, 5xx)."""
+    for attempt in range(max_retries + 1):
+        response = session.get(url, timeout=timeout)
+        if response.status_code not in _RETRYABLE_STATUS:
+            response.raise_for_status()
+            return response
+        if attempt == max_retries:
+            response.raise_for_status()
+        wait = float(response.headers.get('Retry-After', 2 ** attempt))
+        print(f"  [retry {attempt + 1}/{max_retries}] HTTP {response.status_code} — "
+              f"waiting {wait:.0f}s before retrying...")
+        time.sleep(wait)
+    return response  # unreachable
+
+
+def _follow_pages(
+        session: requests.Session,
+        url: str,
+        max_retries: int = 3
+) -> Generator[Dict, None, None]:
     """Fetch a paginated FHIR Bundle sequence, yielding one Bundle per page."""
     while url:
-        response = session.get(url, timeout=60)
-        response.raise_for_status()
+        response = _get_with_retry(session, url, max_retries=max_retries)
         bundle = response.json()
         yield bundle
         url = next(
@@ -1117,11 +1180,12 @@ def fetch_patient_count(session: requests.Session, base_url: str) -> Optional[in
 def fetch_patient_ids(
         session: requests.Session,
         base_url: str,
-        page_size: int = 100
+        page_size: int = 100,
+        max_retries: int = 3
 ) -> Generator[str, None, None]:
     """Stream patient IDs from GET /Patient, following pagination."""
     url = f"{base_url}/Patient?_count={page_size}&_elements=id"
-    for bundle in _follow_pages(session, url):
+    for bundle in _follow_pages(session, url, max_retries=max_retries):
         for entry in bundle.get('entry', []):
             pid = entry.get('resource', {}).get('id')
             if pid:
@@ -1133,12 +1197,13 @@ def fetch_patient_resources(
         base_url: str,
         patient_id: str,
         page_size: int = 100,
-        errors: Optional[List[str]] = None
+        errors: Optional[List[str]] = None,
+        max_retries: int = 3
 ) -> Generator[Dict, None, None]:
     """Stream all resources for a patient via $everything, following pagination."""
     url = f"{base_url}/Patient/{patient_id}/$everything?_count={page_size}"
     try:
-        for bundle in _follow_pages(session, url):
+        for bundle in _follow_pages(session, url, max_retries=max_retries):
             for entry in bundle.get('entry', []):
                 resource = entry.get('resource')
                 if resource and isinstance(resource, dict):
@@ -1754,40 +1819,67 @@ def run_profiler(config: ProfilerConfig) -> dict:
         print(f"Server: {config.server_base_url}")
         print("=" * 70)
 
-    # Connect and count patients
+    # Verify server is reachable before doing anything else
     session = make_session(config.auth_token)
-    fetch_errors: List[str] = []
+    if not check_server(session, config.server_base_url, verbose):
+        return {'error': 'Server unreachable'}
 
+    fetch_errors: List[str] = []
     total_patients = fetch_patient_count(session, config.server_base_url)
+    effective_limit = config.patient_limit or total_patients  # None if both unknown
+
     if verbose:
         count_str = f"{total_patients:,}" if total_patients is not None else "unknown"
-        print(f"\nPatients on server: {count_str}")
+        limit_str = f" (limited to first {config.patient_limit:,})" if config.patient_limit else ""
+        print(f"\nPatients on server: {count_str}{limit_str}")
+        if config.request_delay > 0:
+            print(f"Request delay: {config.request_delay}s between patients")
 
     if total_patients == 0:
         print("No patients found on server!")
         return {'error': 'No patients found'}
 
-    # Initialize aggregator
     aggregator = Aggregator(config)
+    tracemalloc.start()
 
     if verbose:
         print(f"\nFetching and processing patients...")
 
     for idx, patient_id in enumerate(
-            fetch_patient_ids(session, config.server_base_url, config.page_size), 1):
+            fetch_patient_ids(session, config.server_base_url, config.page_size, config.max_retries), 1):
         try:
             for resource in fetch_patient_resources(
                     session, config.server_base_url, patient_id,
-                    config.page_size, fetch_errors):
+                    config.page_size, fetch_errors, config.max_retries):
                 aggregator.process_resource(resource)
             aggregator.mark_file_processed()
 
-            if verbose and (idx % 10 == 0 or idx == total_patients):
+            if verbose and (idx % 10 == 0 or idx == effective_limit):
+                elapsed_so_far = time.time() - start_time
+                pat_per_sec = idx / elapsed_so_far if elapsed_so_far > 0 else 0
+                eta_sec = (effective_limit - idx) / pat_per_sec if (pat_per_sec > 0 and effective_limit) else 0
+                _, peak_bytes = tracemalloc.get_traced_memory()
                 summary = aggregator.get_summary()
-                print(f"  [{idx}/{total_patients or '?'}] Resources: {summary['total_resources']:,}")
+                print(f"  [{idx}/{effective_limit or '?'}] "
+                      f"Resources: {summary['total_resources']:,} | "
+                      f"{pat_per_sec:.1f} pat/s | "
+                      f"ETA: {eta_sec / 60:.1f} min | "
+                      f"Peak RAM: {peak_bytes / 1024 / 1024:.0f} MB")
+
+            if config.patient_limit and idx >= config.patient_limit:
+                if verbose:
+                    print(f"\n  Patient limit of {config.patient_limit:,} reached — stopping.")
+                break
+
+            if config.request_delay > 0:
+                time.sleep(config.request_delay)
 
         except Exception as e:
             fetch_errors.append(f"Fatal error processing Patient/{patient_id}: {e}")
+
+    _, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    peak_mb = peak_bytes / 1024 / 1024
 
     # Get results
     results = aggregator.get_results()
@@ -1802,6 +1894,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
         print(f"  Resource types:     {len(summary['resource_types'])}")
         print(f"  Unique patients:    {len(relational.known_ids.get('Patient', set())):,}")
         print(f"  Unique encounters:  {len(relational.known_ids.get('Encounter', set())):,}")
+        print(f"  Peak RAM:           {peak_mb:.0f} MB")
         print("-" * 50)
 
     # Export all results
@@ -1818,12 +1911,12 @@ def run_profiler(config: ProfilerConfig) -> dict:
             for error in all_errors:
                 f.write(f"{error}\n")
         if verbose:
-            print(f"\nErrors written to: {error_file}")
+            print(f"\n  {len(all_errors)} error(s) written to: {error_file.name}")
 
     elapsed = time.time() - start_time
 
     if verbose:
-        print(f"\nDone! Elapsed time: {elapsed:.2f} seconds")
+        print(f"\nDone! Elapsed: {elapsed:.2f}s | Peak RAM: {peak_mb:.0f} MB")
         print(f"\nOutput files:")
         for name, path in sorted(output_files.items()):
             print(f"  {path.name}")
@@ -1834,6 +1927,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
         'resource_types': summary['resource_types'],
         'unique_patients': len(relational.known_ids.get('Patient', set())),
         'unique_encounters': len(relational.known_ids.get('Encounter', set())),
+        'peak_ram_mb': round(peak_mb, 1),
         'output_files': output_files,
         'elapsed_seconds': elapsed,
         'error_count': len(all_errors)
@@ -1859,6 +1953,9 @@ Examples:
     parser.add_argument('server_url', type=str, help='Base URL of the FHIR server')
     parser.add_argument('output_dir', type=Path, help='Directory for output files')
     parser.add_argument('--token', type=str, default=None, help='Bearer token for authentication')
+    parser.add_argument('--limit', type=int, default=None, help='Stop after N patients (for test runs)')
+    parser.add_argument('--request-delay', type=float, default=0.0, help='Seconds to wait between patients (default: 0)')
+    parser.add_argument('--max-retries', type=int, default=3, help='Retries for transient server errors (default: 3)')
     parser.add_argument('--page-size', type=int, default=100, help='Resources per page (default: 100)')
     parser.add_argument('--top-n', type=int, default=20, help='Top values to track (default: 20)')
     parser.add_argument('--hll-precision', type=int, default=14, help='HyperLogLog precision (default: 14)')
@@ -1873,6 +1970,9 @@ Examples:
         server_base_url=args.server_url,
         output_dir=args.output_dir,
         auth_token=args.token,
+        patient_limit=args.limit,
+        request_delay=args.request_delay,
+        max_retries=args.max_retries,
         page_size=args.page_size,
         top_values_limit=args.top_n,
         hll_precision=args.hll_precision,
