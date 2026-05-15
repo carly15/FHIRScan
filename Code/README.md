@@ -28,8 +28,9 @@ Both scripts share the same statistics, relational analysis, and export logic.
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+
 - `requests` — required for `profiler_server.py` only (`pip install requests`)
+- `backports.zoneinfo` — only needed on Python 3.8 (`pip install backports.zoneinfo`)
 
 ---
 
@@ -61,6 +62,7 @@ python profiler_file.py /data/fhir ./output --no-relations --quiet
 | `--top-n N` | Most frequent values to track per field | 20 |
 | `--no-relations` | Skip relational analysis | off |
 | `--no-inline-extensions` | Don't flatten extension URLs into paths | off |
+| `--run-name NAME` | Custom output subfolder name instead of timestamp | timestamp |
 | `--quiet` | Suppress progress output | off |
 
 ---
@@ -87,9 +89,12 @@ python profiler_server.py http://myserver/fhir ./output --token <bearer_token>
 | `--page-size N` | Resources per page for pagination | 100 |
 | `--top-n N` | Most frequent values to track per field | 20 |
 | `--no-relations` | Skip relational analysis | off |
+| `--run-name NAME` | Custom output subfolder name instead of timestamp | timestamp |
 | `--quiet` | Suppress progress output | off |
 
 The server profiler checks the connection via `/metadata` before processing and prints server name, version, and FHIR version. Progress is reported every 10 patients with throughput, ETA, and peak RAM.
+
+> **Scope note:** only patient-linked resources are profiled. The `$everything` operation returns only resources associated with a patient. Standalone resources — `Organization`, `Practitioner`, `Location`, `ValueSet`, `CodeSystem`, and `Medication` entries not linked to a patient — are invisible to the server profiler. This is an accepted restriction; a full server scan would require many additional query types and substantially more processing time.
 
 ---
 
@@ -100,7 +105,7 @@ One timestamped subfolder per run under `<output_dir>/`, containing:
 | File | Content |
 |------|---------|
 | `<ResourceType>_fields.csv` | Field-level statistics per resource type |
-| `_summary.csv` | One row per resource type (counts, field completeness) |
+| `_summary.csv` | One row per resource type: total/linked/unlinked counts, avg per patient, field completeness |
 | `_summary_details.csv` | Field-level presence categories (always/sometimes/never) |
 | `_cardinality.csv` | Resources per patient / per encounter |
 | `_data_quality.csv` | Patient and encounter linkage rates |

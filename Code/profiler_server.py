@@ -19,6 +19,7 @@ Funktionsweise
    - Vorkommen und Vollständigkeit (presence rate)
    - Datentypen (FHIR R4B-spezifisch: CodeableConcept, Reference, Period, ...)
    - Werteverteilung (Top-N-Werte, Kardinalität via HyperLogLog)
+   - Numerische Kennzahlen (Min, Max, Mittelwert, Standardabweichung)
 6. **Relationale Analyse**:
    - Kardinalitäten (Ressourcen je Patient / Encounter)
    - Referenzintegrität (dangling references)
@@ -26,6 +27,15 @@ Funktionsweise
    - Strukturtiefe und Komplexitätsmetriken
    - Data Quality Score je Ressourcentyp
 7. **Export**: Schreibt die Ergebnisse als CSV-Dateien in das Ausgabeverzeichnis.
+
+Einschränkungen
+---------------
+Nur patientenzentrierte Ressourcen werden erfasst.  Der `$everything`-Endpunkt
+liefert ausschließlich Ressourcen, die einem Patienten zugeordnet sind.
+Standalone-Ressourcen wie Organization, Practitioner, Location, ValueSet,
+CodeSystem oder patientenunverknüpfte Medication-Einträge sind für den Profiler
+unsichtbar.  Diese Einschränkung ist bewusst akzeptiert — eine vollständige
+Serverabfrage würde erheblich mehr Anfragen und Verarbeitungszeit erfordern.
 
 Verwendung
 ----------
@@ -38,6 +48,8 @@ Optionen
     --request-delay SEC   Pause zwischen Patienten in Sekunden (Server schonen)
     --max-retries N       Wiederholungsversuche bei Serverfehlern (Standard: 3)
     --page-size N         Ressourcen pro Seite (Standard: 100)
+    --skip-types TYPEN    Kommagetrennte Ressourcentypen ausschließen (z. B. Binary)
+    --run-name NAME       Eigener Name für den Ausgabeordner (Standard: Zeitstempel)
     --no-relations        Relationale Analyse deaktivieren
     --quiet               Keine Fortschrittsausgabe
 
@@ -48,7 +60,7 @@ Named classes and functions are also listed in your IDE's Outline/Structure pane
 
     profiler_server.py
     ├── CONFIGURATION ──────── ProfilerConfig
-    ├── UTILITIES ──────────── get_python_type
+    ├── UTILITIES ──────────── get_python_type · _check_output_writable
     ├── FHIR R4B TYPE DETECTION  detect_fhir_type · parse_fhir_reference
     │                            parse_fhir_datetime
     ├── HYPERLOGLOG ────────── HyperLogLog
@@ -83,6 +95,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 from datetime import datetime
 import statistics
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
+
+_BERLIN_TZ = ZoneInfo('Europe/Berlin')
 
 
 # =============================================================================
@@ -106,6 +124,8 @@ class ProfilerConfig:
     hll_threshold: int = 10000
     inline_extensions: bool = True
     verbose: bool = True
+    run_name: Optional[str] = None          # custom output subfolder name; defaults to timestamp
+    skip_types: Set[str] = field(default_factory=set)  # resource types to exclude from profiling
 
     # Relational analysis settings
     analyze_relations: bool = True
@@ -120,28 +140,6 @@ class ProfilerConfig:
 # =============================================================================
 # UTILITIES
 # =============================================================================
-
-def safe_json_load(file_path: Path) -> Generator[dict, None, None]:
-    """Load JSON or NDJSON file, yielding parsed objects."""
-    with open(file_path, 'r', encoding='utf-8') as f:
-        if file_path.suffix.lower() == '.ndjson':
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if line:
-                    try:
-                        yield json.loads(line)
-                    except json.JSONDecodeError as e:
-                        print(f"Warning: Invalid JSON at {file_path}:{line_num}: {e}")
-        else:
-            try:
-                data = json.load(f)
-                if isinstance(data, list):
-                    yield from data
-                else:
-                    yield data
-            except json.JSONDecodeError as e:
-                print(f"Warning: Invalid JSON in {file_path}: {e}")
-
 
 def get_python_type(value: Any) -> str:
     """Get a readable type name for a value."""
@@ -160,6 +158,19 @@ def get_python_type(value: Any) -> str:
     if isinstance(value, dict):
         return "dictionary"
     return type(value).__name__
+
+
+def _check_output_writable(output_dir: Path) -> bool:
+    """Verify output_dir is writable before starting a long run."""
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        test_file = output_dir / '.write_test'
+        test_file.touch()
+        test_file.unlink()
+        return True
+    except (PermissionError, OSError) as e:
+        print(f"Error: output directory is not writable: {output_dir}\n  {e}")
+        return False
 
 
 # =============================================================================
@@ -539,7 +550,12 @@ def parse_fhir_reference(reference: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def parse_fhir_datetime(value: str) -> Optional[datetime]:
-    """Parse FHIR datetime string to Python datetime."""
+    """Parse a FHIR datetime string and return it normalized to Europe/Berlin.
+
+    Naive datetimes (no timezone in the string) are assumed to already be Berlin
+    local time and are stamped accordingly.  Timezone-aware datetimes are converted
+    to Berlin time.  This ensures all datetimes are comparable without TypeError.
+    """
     if not value or not isinstance(value, str):
         return None
 
@@ -558,7 +574,10 @@ def parse_fhir_datetime(value: str) -> Optional[datetime]:
 
     for fmt in formats:
         try:
-            return datetime.strptime(value_clean, fmt)
+            dt = datetime.strptime(value_clean, fmt)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=_BERLIN_TZ)   # assume Berlin local time
+            return dt.astimezone(_BERLIN_TZ)            # convert any other TZ to Berlin
         except ValueError:
             continue
 
@@ -657,9 +676,27 @@ class FieldStatistics:
     max_value_length: int = 200
     fhir_types: Counter = field(default_factory=Counter)  # detected FHIR complex type(s) when field is an object
 
+    # Numeric statistics accumulated via Welford's online algorithm (no list of values stored)
+    numeric_count: int = 0
+    numeric_min: Optional[float] = None
+    numeric_max: Optional[float] = None
+    _numeric_mean: float = field(default=0.0, init=False, repr=False)
+    _numeric_M2: float = field(default=0.0, init=False, repr=False)
+
     def add_value(self, value: Any, python_type: str) -> None:
         self.value_count += 1
         self.types_seen[python_type] += 1
+
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            fv = float(value)
+            self.numeric_count += 1
+            if self.numeric_min is None or fv < self.numeric_min:
+                self.numeric_min = fv
+            if self.numeric_max is None or fv > self.numeric_max:
+                self.numeric_max = fv
+            delta = fv - self._numeric_mean
+            self._numeric_mean += delta / self.numeric_count
+            self._numeric_M2 += delta * (fv - self._numeric_mean)
 
         str_value = str(value)
         # Truncate very long values to avoid excessive memory use
@@ -717,6 +754,16 @@ class FieldStatistics:
         if not self.fhir_types:
             return ''
         return self.fhir_types.most_common(1)[0][0]
+
+    @property
+    def numeric_mean(self) -> Optional[float]:
+        return round(self._numeric_mean, 6) if self.numeric_count > 0 else None
+
+    @property
+    def numeric_stdev(self) -> Optional[float]:
+        if self.numeric_count < 2:
+            return None
+        return round(math.sqrt(self._numeric_M2 / (self.numeric_count - 1)), 6)
 
 
 @dataclass
@@ -1289,6 +1336,7 @@ class Aggregator:
         # Tracks (resourceType, id) pairs already processed to prevent double-counting
         # resources that appear in multiple patient bundles (e.g. shared Medication records)
         self.seen_resource_ids: Set[Tuple[str, str]] = set()
+        self.dedup_counts: Counter = Counter()  # per-type count of skipped duplicates
 
     def _get_or_create_resource_type(self, resource_type: str) -> ResourceTypeStatistics:
         if resource_type not in self.resource_types:
@@ -1308,6 +1356,9 @@ class Aggregator:
             self.errors.append("Resource without resourceType encountered")
             return
 
+        if resource_type in self.config.skip_types:
+            return
+
         # Deduplicate by (resourceType, id): the same resource can appear in multiple
         # patient bundles (e.g. a shared Medication record). Without this check it
         # would be counted once per bundle, inflating totals.
@@ -1315,6 +1366,7 @@ class Aggregator:
         if resource_id:
             dedup_key = (resource_type, resource_id)
             if dedup_key in self.seen_resource_ids:
+                self.dedup_counts[resource_type] += 1
                 return
             self.seen_resource_ids.add(dedup_key)
 
@@ -1402,7 +1454,7 @@ class Aggregator:
                 self.relational.cardinality_by_encounter[resource_type][local_encounter_ref] += 1
                 self.relational.resources_with_encounter_ref[resource_type] += 1
 
-            if resource_type == 'Encounter' and local_patient_ref:
+            if resource_type == 'Encounter' and local_patient_ref and resource_id:
                 self.relational.encounter_to_patient[resource_id] = local_patient_ref
 
     def process_resources(self, resources: List[Dict[str, Any]]) -> None:
@@ -1435,6 +1487,9 @@ class Aggregator:
     def get_relational_results(self) -> RelationalAnalyzer:
         return self.relational
 
+    def get_dedup_counts(self) -> Counter:
+        return self.dedup_counts
+
 
 # =============================================================================
 # EXPORT FUNCTIONS
@@ -1461,7 +1516,9 @@ def export_resource_type_csv(
         'field_path', 'resources_with_field', 'total_resources',
         'presence_rate', 'missing_rate', 'value_count', 'unique_count',
         'unique_count_approximate', 'detected_python_types', 'detected_fhir_type',
-        'type_inconsistency', 'top_values'
+        'type_inconsistency',
+        'numeric_count', 'numeric_min', 'numeric_max', 'numeric_mean', 'numeric_stdev',
+        'top_values'
     ]
 
     sorted_fields = sorted(stats.field_stats.items(), key=lambda x: x[0])
@@ -1485,6 +1542,11 @@ def export_resource_type_csv(
                 'detected_python_types': ', '.join(field_stats.detected_python_types),
                 'detected_fhir_type': field_stats.detected_fhir_type,
                 'type_inconsistency': field_stats.has_type_inconsistency,
+                'numeric_count': field_stats.numeric_count or '',
+                'numeric_min': field_stats.numeric_min if field_stats.numeric_min is not None else '',
+                'numeric_max': field_stats.numeric_max if field_stats.numeric_max is not None else '',
+                'numeric_mean': field_stats.numeric_mean if field_stats.numeric_mean is not None else '',
+                'numeric_stdev': field_stats.numeric_stdev if field_stats.numeric_stdev is not None else '',
                 'top_values': format_top_values(field_stats.top_values)
             })
 
@@ -1625,14 +1687,19 @@ def _export_analysis_txt(title: str, data: Any, filename: str, output_dir: Path)
 def export_summary_csv(
         results: Dict[str, ResourceTypeStatistics],
         output_dir: Path,
+        relational: 'RelationalAnalyzer',
+        dedup_counts: Counter,
         unique_patients: int = 0
 ) -> Path:
     """Export summary of all resource types."""
     output_file = output_dir / "_summary.csv"
 
     columns = [
-        'resource_type', 'total_resources', 'avg_resources_per_patient', 'total_fields',
-        'fields_always_present', 'fields_sometimes_present', 'fields_with_type_inconsistency'
+        'resource_type', 'total_resources', 'deduplicated_resources',
+        'patient_linked_resources', 'unlinked_resources', 'patient_linkage_rate',
+        'avg_resources_per_patient',
+        'total_fields', 'fields_always_present', 'fields_sometimes_present',
+        'fields_with_type_inconsistency'
     ]
 
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
@@ -1652,11 +1719,23 @@ def export_summary_csv(
                 1 for fs in stats.field_stats.values()
                 if fs.has_type_inconsistency
             )
-            avg = round(stats.total_resources / unique_patients, 1) if unique_patients > 0 else ''
+
+            # Patient resources ARE the anchor — treat them as fully linked
+            if resource_type == 'Patient':
+                linked = stats.total_resources
+            else:
+                linked = relational.resources_with_patient_ref.get(resource_type, 0)
+            unlinked = stats.total_resources - linked
+            linkage_rate = f"{linked / stats.total_resources:.4f}" if stats.total_resources > 0 else ''
+            avg = round(linked / unique_patients, 2) if unique_patients > 0 else ''
 
             writer.writerow({
                 'resource_type': resource_type,
                 'total_resources': stats.total_resources,
+                'deduplicated_resources': dedup_counts.get(resource_type, 0) or '',
+                'patient_linked_resources': linked,
+                'unlinked_resources': unlinked,
+                'patient_linkage_rate': linkage_rate,
                 'avg_resources_per_patient': avg,
                 'total_fields': len(stats.field_stats),
                 'fields_always_present': always_present,
@@ -1735,6 +1814,7 @@ def export_summary_details_csv(
 def export_all_results(
         results: Dict[str, ResourceTypeStatistics],
         relational: RelationalAnalyzer,
+        dedup_counts: Counter,
         output_dir: Path,
         verbose: bool = True
 ) -> Dict[str, Path]:
@@ -1754,7 +1834,7 @@ def export_all_results(
 
     # Summary (counts) + detailed breakdown (field names per category)
     unique_patients = len(relational.known_ids.get('Patient', set()))
-    output_files['_summary'] = export_summary_csv(results, output_dir, unique_patients)
+    output_files['_summary'] = export_summary_csv(results, output_dir, relational, dedup_counts, unique_patients)
     output_files['_summary_details'] = export_summary_details_csv(results, output_dir)
     if verbose:
         total_fields = sum(len(s.field_stats) for s in results.values())
@@ -1809,12 +1889,14 @@ def export_all_results(
 def run_profiler(config: ProfilerConfig) -> dict:
     """Run the FHIR dataset profiler with relational analysis."""
     start_time = time.time()
-    # Capture timestamp at the moment extraction begins; used to name the output subfolder
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H_%M")
     verbose = config.verbose
 
-    # All output goes into a timestamped subfolder (e.g. Output/20260509_14_30/)
-    timestamped_output_dir = config.output_dir / run_timestamp
+    folder_name = config.run_name if config.run_name else datetime.now().strftime("%Y%m%d_%H_%M")
+    timestamped_output_dir = config.output_dir / folder_name
+
+    if not _check_output_writable(config.output_dir):
+        return {'error': 'Output directory not writable'}
+
     timestamped_output_dir.mkdir(parents=True, exist_ok=True)
 
     if verbose:
@@ -1844,7 +1926,8 @@ def run_profiler(config: ProfilerConfig) -> dict:
         return {'error': 'No patients found'}
 
     aggregator = Aggregator(config)
-    tracemalloc.start()
+    if not tracemalloc.is_tracing():
+        tracemalloc.start()
 
     if verbose:
         print(f"\nFetching and processing patients...")
@@ -1888,6 +1971,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
     # Get results
     results = aggregator.get_results()
     relational = aggregator.get_relational_results()
+    dedup_counts = aggregator.get_dedup_counts()
     summary = aggregator.get_summary()
 
     if verbose:
@@ -1905,7 +1989,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
     if verbose:
         print(f"\nExporting results to: {timestamped_output_dir}")
 
-    output_files = export_all_results(results, relational, timestamped_output_dir, verbose)
+    output_files = export_all_results(results, relational, dedup_counts, timestamped_output_dir, verbose)
 
     # Write errors
     all_errors = aggregator.errors + fetch_errors
@@ -1942,7 +2026,8 @@ def run_profiler(config: ProfilerConfig) -> dict:
 # CLI ENTRY POINT
 # =============================================================================
 
-def main():
+def \
+        main():
     parser = argparse.ArgumentParser(
         description='Profile a FHIR R4 server via $everything for all patients.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1966,6 +2051,10 @@ Examples:
     parser.add_argument('--hll-threshold', type=int, default=10000, help='HLL switch threshold (default: 10000)')
     parser.add_argument('--no-inline-extensions', action='store_true', help='Don\'t inline extension URLs')
     parser.add_argument('--no-relations', action='store_true', help='Skip relational analysis')
+    parser.add_argument('--skip-types', type=str, default='',
+                        help='Comma-separated resource types to exclude (e.g. Binary,DocumentReference)')
+    parser.add_argument('--run-name', type=str, default=None,
+                        help='Custom name for the output subfolder (default: timestamp)')
     parser.add_argument('--quiet', '-q', action='store_true', help='Suppress output')
 
     args = parser.parse_args()
@@ -1983,6 +2072,8 @@ Examples:
         hll_threshold=args.hll_threshold,
         inline_extensions=not args.no_inline_extensions,
         analyze_relations=not args.no_relations,
+        skip_types={t.strip() for t in args.skip_types.split(',') if t.strip()},
+        run_name=args.run_name,
         verbose=not args.quiet
     )
 
