@@ -1515,7 +1515,7 @@ def export_cardinality_csv(
         output_dir: Path
 ) -> Path:
     """Export cardinality analysis with patient/encounter coverage."""
-    output_file = output_dir / "_cardinality.csv"
+    output_file = output_dir / "03_cardinality.csv"
 
     # Pre-compute totals for coverage ratios
     total_patients = len(relational.known_ids.get('Patient', set()))
@@ -1586,7 +1586,7 @@ def export_data_quality_csv(
         output_dir: Path
 ) -> Path:
     """Export data quality metrics."""
-    output_file = output_dir / "_data_quality.csv"
+    output_file = output_dir / "04_data_quality.csv"
 
     columns = [
         'resource_type', 'total_resources', 'with_patient_reference',
@@ -1648,7 +1648,7 @@ def export_summary_csv(
         unique_patients: int = 0
 ) -> Path:
     """Export summary of all resource types."""
-    output_file = output_dir / "_summary.csv"
+    output_file = output_dir / "01_summary.csv"
 
     columns = [
         'resource_type', 'total_resources', 'deduplicated_resources',
@@ -1713,7 +1713,7 @@ def export_summary_details_csv(
     type inconsistency flag — so the user can filter and follow up on
     always-present, sometimes-present, or type-inconsistent fields by name.
     """
-    output_file = output_dir / "_summary_details.csv"
+    output_file = output_dir / "02_summary_details.csv"
 
     columns = [
         'resource_type',
@@ -1814,7 +1814,7 @@ def export_all_results(
     # Reference integrity
     integrity = relational.compute_reference_integrity()
     output_files['_reference_integrity'] = _export_analysis_txt(
-        "REFERENCE INTEGRITY ANALYSIS", integrity, "_reference_integrity.txt", output_dir
+        "REFERENCE INTEGRITY ANALYSIS", integrity, "05_reference_integrity.txt", output_dir
     )
     if verbose:
         print(f"  Reference integrity: {integrity['total_references']} references analysed")
@@ -1822,7 +1822,7 @@ def export_all_results(
     # Temporal analysis
     temporal = relational.compute_temporal_stats()
     output_files['_temporal'] = _export_analysis_txt(
-        "TEMPORAL ANALYSIS", temporal, "_temporal_analysis.txt", output_dir
+        "TEMPORAL ANALYSIS", temporal, "06_temporal_analysis.txt", output_dir
     )
     if verbose:
         print(f"  Temporal: {temporal['resources_with_dates']} dated resources")
@@ -1830,7 +1830,7 @@ def export_all_results(
     # Structural analysis
     structural = relational.compute_structural_stats()
     output_files['_structural'] = _export_analysis_txt(
-        "STRUCTURAL DEPTH ANALYSIS", structural, "_structural_analysis.txt", output_dir
+        "STRUCTURAL DEPTH ANALYSIS", structural, "07_structural_analysis.txt", output_dir
     )
     if verbose:
         print(f"  Structural depth: {len(structural['depth_by_type'])} resource types")
@@ -1915,7 +1915,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
     # Write errors
     all_errors = aggregator.errors + extraction_errors + scan_result.scan_errors
     if all_errors:
-        error_file = timestamped_output_dir / "_errors.txt"
+        error_file = timestamped_output_dir / "99_errors.txt"
         with open(error_file, 'w', encoding='utf-8') as f:
             for error in all_errors:
                 f.write(f"{error}\n")

@@ -40,7 +40,7 @@ The server profiler is **patient-centric by design**. The `$everything` operatio
 Practically, this means:
 
 - You cannot assess the **field completeness of reference targets** — e.g. how complete `Organization` records are, even though patient resources reference them.
-- Resources that exist on the server but are **incorrectly unlinked** (e.g. an Encounter with no `subject`) are counted separately in `_summary.csv` as `unlinked_resources` but are not profiled at the field level.
+- Resources that exist on the server but are **incorrectly unlinked** (e.g. an Encounter with no `subject`) are counted separately in `01_summary.csv` as `unlinked_resources` but are not profiled at the field level.
 - The **reference integrity analysis** can detect dangling references *from* patient resources to missing targets, but cannot tell you whether those targets are absent or merely unlinked.
 
 If any of the above matters for your analysis, export the data first and use `profiler_file.py`.
@@ -56,7 +56,7 @@ If any of the above matters for your analysis, export the data first and use `pr
 - **HyperLogLog cardinality estimation** — memory-efficient unique-value counting; switches automatically at a configurable threshold
 - **Extension inlining** — extension URLs are embedded in field paths rather than indexed, supporting MII profiles
 - **Relational analysis** — reference integrity, cardinalities per patient/encounter, temporal distribution, structural depth, and data quality scoring
-- **Patient linkage tracking** — every resource type is classified as patient-linked or unlinked; `_summary.csv` reports both counts
+- **Patient linkage tracking** — every resource type is classified as patient-linked or unlinked; `01_summary.csv` reports both counts
 - **Deduplication tracking** — shared resources appearing in multiple patient bundles are counted once; the number of skipped duplicates is reported
 - **Resource type filter** — exclude specific types (e.g. `Binary`) to save time and memory
 - **Write-permission check** — verifies the output directory is writable before starting a long run
@@ -148,15 +148,15 @@ Each run writes to its own subfolder under `<output_dir>/` (named by timestamp o
 
 | File | Content |
 |------|---------|
+| `01_summary.csv` | One row per resource type — counts, linkage, averages, field completeness |
+| `02_summary_details.csv` | One row per field per resource type — presence category and type consistency |
+| `03_cardinality.csv` | Distribution of resources per patient and per encounter (min/max/mean/percentiles) |
+| `04_data_quality.csv` | Patient and encounter linkage rates per resource type |
+| `05_reference_integrity.txt` | Orphan reference analysis — dangling references by source and target type |
+| `06_temporal_analysis.txt` | Date ranges per resource type and patient record span statistics |
+| `07_structural_analysis.txt` | Nesting depth and array size statistics per resource type |
 | `<ResourceType>_fields.csv` | Field-level statistics per resource type — see column details below |
-| `_summary.csv` | One row per resource type — counts, linkage, averages, field completeness |
-| `_summary_details.csv` | One row per field per resource type — presence category and type consistency |
-| `_cardinality.csv` | Distribution of resources per patient and per encounter (min/max/mean/percentiles) |
-| `_data_quality.csv` | Patient and encounter linkage rates per resource type |
-| `_reference_integrity.txt` | Orphan reference analysis — dangling references by source and target type |
-| `_temporal_analysis.txt` | Date ranges per resource type and patient record span statistics |
-| `_structural_analysis.txt` | Nesting depth and array size statistics per resource type |
-| `_errors.txt` | Parse or fetch errors (only written if errors occurred) |
+| `99_errors.txt` | Parse or fetch errors (only written if errors occurred) |
 
 ### `<ResourceType>_fields.csv` columns
 
@@ -180,7 +180,7 @@ Each run writes to its own subfolder under `<output_dir>/` (named by timestamp o
 | `numeric_stdev` | Sample standard deviation |
 | `top_values` | JSON array of `[value, count]` pairs for the most frequent values |
 
-### `_summary.csv` columns
+### `01_summary.csv` columns
 
 | Column | Description |
 |--------|-------------|
