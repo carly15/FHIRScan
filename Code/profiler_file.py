@@ -65,7 +65,6 @@ Named classes and functions are also listed in your IDE's Outline/Structure pane
 
 import sys
 import time
-import tracemalloc
 import json
 import csv
 import math
@@ -1844,8 +1843,6 @@ def run_profiler(config: ProfilerConfig) -> dict:
 
     # Initialize aggregator
     aggregator = Aggregator(config)
-    if not tracemalloc.is_tracing():
-        tracemalloc.start()
 
     # Process files
     if verbose:
@@ -1867,10 +1864,6 @@ def run_profiler(config: ProfilerConfig) -> dict:
         except Exception as e:
             extraction_errors.append(f"Fatal error processing {file_path}: {e}")
 
-    _, peak_bytes = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    peak_mb = peak_bytes / 1024 / 1024
-
     # Get results
     results = aggregator.get_results()
     relational = aggregator.get_relational_results()
@@ -1885,7 +1878,6 @@ def run_profiler(config: ProfilerConfig) -> dict:
         print(f"  Resource types:   {len(summary['resource_types'])}")
         print(f"  Unique patients:  {len(relational.known_ids.get('Patient', set())):,}")
         print(f"  Unique encounters:{len(relational.known_ids.get('Encounter', set())):,}")
-        print(f"  Peak RAM:         {peak_mb:.0f} MB")
         print("-" * 50)
 
     # Export all results
@@ -1907,7 +1899,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
     elapsed = time.time() - start_time
 
     if verbose:
-        print(f"\nDone! Elapsed: {elapsed:.2f}s | Peak RAM: {peak_mb:.0f} MB")
+        print(f"\nDone! Elapsed time: {elapsed:.2f} seconds")
         print(f"\nOutput files:")
         for name, path in sorted(output_files.items()):
             print(f"  {path.name}")
@@ -1918,7 +1910,6 @@ def run_profiler(config: ProfilerConfig) -> dict:
         'resource_types': summary['resource_types'],
         'unique_patients': len(relational.known_ids.get('Patient', set())),
         'unique_encounters': len(relational.known_ids.get('Encounter', set())),
-        'peak_ram_mb': round(peak_mb, 1),
         'output_files': output_files,
         'elapsed_seconds': elapsed,
         'error_count': len(all_errors)
