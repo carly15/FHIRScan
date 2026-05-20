@@ -134,11 +134,13 @@ python profiler_server.py http://localhost:8080/fhir ./output --skip-types Binar
 | `--page-size N` | Resources per page for pagination | 100 |
 | `--top-n N` | Most frequent values to track per field | 20 |
 | `--skip-types TYPES` | Comma-separated resource types to exclude (e.g. `Binary`) | none |
+| `--dedup-types TYPES` | Resource types that may appear in multiple patient bundles and need deduplication | `Medication,Location` |
+| `--integrity-types TYPES` | Resource types tracked for reference integrity checks but not deduplicated (common reference targets) | `Patient,Encounter,Practitioner,…` |
 | `--no-relations` | Skip relational analysis | off |
 | `--run-name NAME` | Custom output subfolder name instead of timestamp | timestamp |
 | `--quiet` | Suppress progress output | off |
 
-The server profiler verifies the connection via `/metadata` before processing and prints server name and FHIR version. Progress is reported every 10 patients with throughput, ETA, and peak RAM usage.
+The server profiler verifies the connection via `/metadata` before processing and prints server name and FHIR version. Progress is reported every 500 patients with throughput, ETA, and peak RAM usage.
 
 ---
 
@@ -178,7 +180,7 @@ Each run writes to its own subfolder under `<output_dir>/` (named by timestamp o
 | `numeric_max` | Maximum value |
 | `numeric_mean` | Mean (Welford's online algorithm) |
 | `numeric_stdev` | Sample standard deviation |
-| `top_values` | JSON array of `[value, count]` pairs for the most frequent values |
+| `top_values` | JSON array of `[value, count]` pairs for the most frequent values; for high-cardinality fields (unique values > HLL threshold) a sample from the first observed values is shown instead |
 
 ### `01_summary.csv` columns
 

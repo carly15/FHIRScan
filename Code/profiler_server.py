@@ -65,8 +65,7 @@ Named classes and functions are also listed in your IDE's Outline/Structure pane
     │                            parse_fhir_datetime
     ├── HYPERLOGLOG ────────── HyperLogLog
     ├── FIELD STATISTICS ───── FieldStatistics · ResourceTypeStatistics
-    ├── RELATIONAL STATISTICS  CardinalityStats · ReferenceInfo · TemporalInfo
-    │                          RelationalAnalyzer
+    ├── RELATIONAL STATISTICS  CardinalityStats · RelationalAnalyzer
     ├── SERVER CONNECTION ──── make_session · check_server · _get_with_retry
     │                          _follow_pages · fetch_patient_count
     │                          fetch_patient_ids · fetch_patient_resources
@@ -94,11 +93,12 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 from datetime import datetime
+import array
 import statistics
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
-    from backports.zoneinfo import ZoneInfo
+    from backports.zoneinfo import ZoneInfo  # type: ignore[import]
 
 _BERLIN_TZ = ZoneInfo('Europe/Berlin')
 
@@ -126,6 +126,23 @@ class ProfilerConfig:
     verbose: bool = True
     run_name: Optional[str] = None          # custom output subfolder name; defaults to timestamp
     skip_types: Set[str] = field(default_factory=set)  # resource types to exclude from profiling
+
+    # ID tracking: controls which resource types have their IDs stored in known_ids.
+    # dedup_types:      shared resources that appear in multiple patient bundles → checked for
+    #                   duplicates before processing. Defaults to Medication and Location.
+    # integrity_types:  resources that are reference targets but always patient-scoped →
+    #                   IDs stored for reference integrity checks only, no dedup overhead.
+    #                   All other resource types (Observation, Condition, etc.) are skipped
+    #                   entirely, saving the bulk of known_ids memory.
+    dedup_types: Set[str] = field(
+        default_factory=lambda: {'Medication', 'Location'}
+    )
+    integrity_types: Set[str] = field(
+        default_factory=lambda: {
+            'Patient', 'Encounter', 'Practitioner', 'PractitionerRole',
+            'Organization', 'Device', 'RelatedPerson', 'Coverage',
+        }
+    )
 
     # Relational analysis settings
     analyze_relations: bool = True
@@ -675,6 +692,7 @@ class FieldStatistics:
     top_n: int = 20
     max_value_length: int = 200
     fhir_types: Counter = field(default_factory=Counter)  # detected FHIR complex type(s) when field is an object
+    _hll_sample: Optional[list] = field(default=None, init=False, repr=False)  # top-N snapshot saved at HLL switch
 
     # Numeric statistics accumulated via Welford's online algorithm (no list of values stored)
     numeric_count: int = 0
@@ -703,11 +721,10 @@ class FieldStatistics:
         if len(str_value) > self.max_value_length:
             str_value = str_value[:self.max_value_length - 3] + "..."
 
-        self.value_counter[str_value] += 1  # for top-N most frequent values
-
         if self.hll is not None:
             self.hll.add(str_value)
         else:
+            self.value_counter[str_value] += 1  # only while cardinality is below threshold
             assert self.exact_values is not None  # exact_values is cleared only when hll is set
             self.exact_values.add(str_value)
             # Once distinct values exceed the threshold, switch to approximate counting
@@ -720,7 +737,10 @@ class FieldStatistics:
         self.hll = HyperLogLog(self.hll_precision)
         for val in self.exact_values:
             self.hll.add(val)
-        self.exact_values = None  # release memory
+        self.exact_values = None
+        # Save top-N snapshot as format examples; clear counter (won't be updated further)
+        self._hll_sample = self.value_counter.most_common(self.top_n)
+        self.value_counter = Counter()
 
     def mark_resource_presence(self) -> None:
         self.resource_count += 1
@@ -737,6 +757,8 @@ class FieldStatistics:
 
     @property
     def top_values(self) -> List[tuple]:
+        if self.hll is not None:
+            return self._hll_sample or []
         return self.value_counter.most_common(self.top_n)
 
     @property
@@ -800,7 +822,7 @@ class ResourceTypeStatistics:
 @dataclass
 class CardinalityStats:
     """Statistics for cardinality distribution."""
-    counts: List[int] = field(default_factory=list)
+    counts: Any = field(default_factory=lambda: array.array('I'))
 
     def add(self, count: int) -> None:
         self.counts.append(count)
@@ -868,209 +890,200 @@ class CardinalityStats:
 
 
 @dataclass
-class ReferenceInfo:
-    """Information about a reference from one resource to another."""
-    source_type: str
-    source_id: str
-    reference_path: str
-    target_type: Optional[str]
-    target_id: Optional[str]
-    raw_reference: str
-
-
-@dataclass
-class TemporalInfo:
-    """Temporal information extracted from a resource."""
-    resource_type: str
-    resource_id: str
-    patient_id: Optional[str]
-    encounter_id: Optional[str]
-    effective_date: Optional[datetime]
-    period_start: Optional[datetime]
-    period_end: Optional[datetime]
-
-
-@dataclass
 class RelationalAnalyzer:
     """Analyzes relationships between FHIR resources."""
 
-    # All resource IDs seen; used to check whether a referenced target actually exists
+    # All resource IDs seen; used for deduplication and reference integrity checks
     known_ids: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
 
-    # Every reference object found across all resources (used for integrity checks)
-    references: List[ReferenceInfo] = field(default_factory=list)
+    # Reference integrity: pre-aggregated during traversal
+    # key = "SourceType.ref_path -> target_type"
+    _ref_totals: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    _ref_unknown_type: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    _ref_targets: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    _ref_examples: Dict[str, list] = field(default_factory=lambda: defaultdict(list))
+    _total_ref_count: int = field(default=0)
 
-    # How many resources of each type link to each patient/encounter ID
+    # Cardinality: live counters (per patient/encounter during processing, flushed after each patient)
     cardinality_by_patient: Dict[str, Dict[str, int]] = field(default_factory=lambda: defaultdict(Counter))
     cardinality_by_encounter: Dict[str, Dict[str, int]] = field(default_factory=lambda: defaultdict(Counter))
+    # Pre-built CardinalityStats (populated by flush_patient_cardinality after each patient bundle)
+    _cardinality_stats: Dict[str, Dict[str, 'CardinalityStats']] = field(
+        default_factory=lambda: defaultdict(dict)
+    )
+    # Reverse mapping for efficient per-patient encounter flushing
+    patient_to_encounters: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
 
     # Maps Encounter ID → Patient ID (built while processing Encounter resources)
     encounter_to_patient: Dict[str, str] = field(default_factory=dict)
 
-    # Temporal data
-    temporal_data: List[TemporalInfo] = field(default_factory=list)
+    # Temporal tracking: incremental per-patient and per-type
+    # _temporal_by_type:    {resource_type: [min_date, max_date, count]}
+    # _temporal_by_patient: {patient_id:    [min_date, max_date]}
+    _temporal_by_type: Dict[str, list] = field(default_factory=lambda: defaultdict(lambda: [None, None, 0]))
+    _temporal_by_patient: Dict[str, list] = field(default_factory=lambda: defaultdict(lambda: [None, None]))
+    _temporal_count: int = field(default=0)
 
-    # Maximum nesting depth per resource (one entry per resource processed)
-    max_depths: Dict[str, List[int]] = field(default_factory=lambda: defaultdict(list))
+    # Maximum nesting depth per resource (array.array for compact int storage)
+    max_depths: Dict[str, Any] = field(default_factory=lambda: defaultdict(lambda: array.array('I')))
     # Sizes of every array encountered, keyed by resource type
-    array_sizes: Dict[str, List[int]] = field(default_factory=lambda: defaultdict(list))
+    array_sizes: Dict[str, Any] = field(default_factory=lambda: defaultdict(lambda: array.array('I')))
 
     # Counts for patient/encounter linkage quality metrics
     resources_with_patient_ref: Dict[str, int] = field(default_factory=Counter)
     resources_without_patient_ref: Dict[str, int] = field(default_factory=Counter)
     resources_with_encounter_ref: Dict[str, int] = field(default_factory=Counter)
 
-    def register_resource(self, resource: Dict[str, Any]) -> None:
-        """Register a resource's existence."""
-        resource_type = resource.get('resourceType')
-        resource_id = resource.get('id')
-
-        if resource_type and resource_id:
-            self.known_ids[resource_type].add(resource_id)
+    def add_reference(self, source_type: str, source_id: str, ref_path: str,
+                      target_type: Optional[str], target_id: Optional[str],
+                      raw_reference: str) -> None:
+        """Accumulate a reference for integrity analysis."""
+        self._total_ref_count += 1
+        key = f"{source_type}.{ref_path} -> {target_type or 'unknown'}"
+        self._ref_totals[key] += 1
+        if target_type is None:
+            self._ref_unknown_type[key] += 1
+        else:
+            self._ref_targets[key][target_id] += 1
+            examples = self._ref_examples[key]
+            if len(examples) < 3:
+                examples.append((f"{source_type}/{source_id}", raw_reference, target_id))
 
     def extract_temporal(self, resource: Dict[str, Any]) -> None:
-        """Extract temporal information from a resource."""
+        """Accumulate temporal data incrementally."""
         resource_type = resource.get('resourceType', 'Unknown')
-        resource_id = resource.get('id', 'unknown')
 
-        # Find patient reference
         patient_id = None
-        encounter_id = None
-
         subject = resource.get('subject', {})
         if isinstance(subject, dict) and subject.get('reference'):
             t, i = parse_fhir_reference(subject['reference'])
             if t == 'Patient':
                 patient_id = i
 
-        encounter = resource.get('encounter', {})
-        if isinstance(encounter, dict) and encounter.get('reference'):
-            t, i = parse_fhir_reference(encounter['reference'])
-            if t == 'Encounter':
-                encounter_id = i
-
-        # Extract dates
         effective_date = None
-        period_start = None
-        period_end = None
-
-        # Try various date fields
         for date_field in ['effectiveDateTime', 'issued', 'authoredOn', 'recordedDate', 'date']:
             if date_field in resource:
                 effective_date = parse_fhir_datetime(resource[date_field])
                 if effective_date:
                     break
 
-        # Try period
         period = resource.get('period', {}) or resource.get('effectivePeriod', {})
+        period_start = None
         if isinstance(period, dict):
             period_start = parse_fhir_datetime(period.get('start'))
-            period_end = parse_fhir_datetime(period.get('end'))
 
-        if effective_date or period_start or period_end:
-            self.temporal_data.append(TemporalInfo(
-                resource_type=resource_type,
-                resource_id=resource_id,
-                patient_id=patient_id,
-                encounter_id=encounter_id,
-                effective_date=effective_date,
-                period_start=period_start,
-                period_end=period_end
-            ))
+        effective = effective_date or period_start
+        if not effective:
+            return
 
+        self._temporal_count += 1
+
+        type_slot = self._temporal_by_type[resource_type]
+        if type_slot[0] is None or effective < type_slot[0]:
+            type_slot[0] = effective
+        if type_slot[1] is None or effective > type_slot[1]:
+            type_slot[1] = effective
+        type_slot[2] += 1
+
+        if patient_id:
+            pat_slot = self._temporal_by_patient[patient_id]
+            if pat_slot[0] is None or effective < pat_slot[0]:
+                pat_slot[0] = effective
+            if pat_slot[1] is None or effective > pat_slot[1]:
+                pat_slot[1] = effective
+
+
+    def _get_or_create_cardinality_stats(self, resource_type: str, anchor_type: str) -> 'CardinalityStats':
+        anchor_stats = self._cardinality_stats[resource_type]
+        if anchor_type not in anchor_stats:
+            anchor_stats[anchor_type] = CardinalityStats()
+        return anchor_stats[anchor_type]
 
     def compute_cardinality_stats(self) -> Dict[str, Dict[str, 'CardinalityStats']]:
         """Compute cardinality statistics per resource type per anchor."""
-        results: Dict[str, Dict[str, CardinalityStats]] = {}
+        # Primary: pre-built stats from per-patient flushes (nearly complete after full run)
+        results: Dict[str, Dict[str, CardinalityStats]] = {
+            rt: dict(anchors) for rt, anchors in self._cardinality_stats.items()
+        }
 
-        def _build_stats(counts_by_anchor: Dict[str, int]) -> CardinalityStats:
-            stats = CardinalityStats()
-            for count in counts_by_anchor.values():
-                stats.add(count)
-            return stats
-
+        # Fallback: flush any remaining data (e.g. last patient in a --limit run)
         for resource_type, patient_counts in self.cardinality_by_patient.items():
-            results.setdefault(resource_type, {})['per_patient'] = _build_stats(patient_counts)
+            if patient_counts:
+                anchor = results.setdefault(resource_type, {})
+                stats = anchor.setdefault('per_patient', CardinalityStats())
+                for count in patient_counts.values():
+                    stats.add(count)
 
         for resource_type, encounter_counts in self.cardinality_by_encounter.items():
-            results.setdefault(resource_type, {})['per_encounter'] = _build_stats(encounter_counts)
+            if encounter_counts:
+                anchor = results.setdefault(resource_type, {})
+                stats = anchor.setdefault('per_encounter', CardinalityStats())
+                for count in encounter_counts.values():
+                    stats.add(count)
 
-        # Encounters per Patient (derived from the encounter→patient mapping)
-        encounters_per_patient: Counter = Counter()
-        for patient_id in self.encounter_to_patient.values():
-            encounters_per_patient[patient_id] += 1
-
+        # Encounters per Patient (from encounter→patient mapping; overrides Encounter per_patient)
+        encounters_per_patient = Counter(self.encounter_to_patient.values())
         if encounters_per_patient:
-            results.setdefault('Encounter', {})['per_patient'] = _build_stats(dict(encounters_per_patient))
+            enc_per_pat = CardinalityStats()
+            for count in encounters_per_patient.values():
+                enc_per_pat.add(count)
+            results.setdefault('Encounter', {})['per_patient'] = enc_per_pat
 
         return results
 
     def compute_reference_integrity(self) -> Dict[str, Any]:
-        """Compute reference integrity statistics."""
-        total_refs = len(self.references)
+        """Compute reference integrity statistics from pre-aggregated counters."""
         orphan_refs = []
-        refs_by_type = defaultdict(lambda: {'total': 0, 'valid': 0, 'orphan': 0, 'unknown_type': 0})
+        refs_by_type = {}
 
-        for ref in self.references:
-            key = f"{ref.source_type}.{ref.reference_path} -> {ref.target_type or 'unknown'}"
-            refs_by_type[key]['total'] += 1
+        for key, total in self._ref_totals.items():
+            unknown = self._ref_unknown_type.get(key, 0)
+            valid = 0
+            orphan = 0
+            target_type = key.rsplit(' -> ', 1)[-1] if ' -> ' in key else 'unknown'
 
-            if ref.target_type is None:
-                refs_by_type[key]['unknown_type'] += 1
-            elif ref.target_id and ref.target_id in self.known_ids.get(ref.target_type, set()):
-                # Target ID was seen in the dataset → valid reference
-                refs_by_type[key]['valid'] += 1
-            else:
-                # Target not found in known_ids → orphan (dangling reference)
-                refs_by_type[key]['orphan'] += 1
-                if len(orphan_refs) < 100:  # Cap examples
-                    orphan_refs.append({
-                        'source': f"{ref.source_type}/{ref.source_id}",
-                        'path': ref.reference_path,
-                        'target': ref.raw_reference
-                    })
+            if target_type != 'unknown':
+                known = self.known_ids.get(target_type, set())
+                for tid, count in self._ref_targets.get(key, {}).items():
+                    if tid and tid in known:
+                        valid += count
+                    else:
+                        orphan += count
+
+            if orphan > 0 and len(orphan_refs) < 100:
+                path_part = key.split('.', 1)[1].rsplit(' -> ', 1)[0] if '.' in key else key
+                for src, raw, _ in self._ref_examples.get(key, [])[:3]:
+                    if len(orphan_refs) < 100:
+                        orphan_refs.append({'source': src, 'path': path_part, 'target': raw})
+
+            refs_by_type[key] = {'total': total, 'valid': valid, 'orphan': orphan, 'unknown_type': unknown}
 
         return {
-            'total_references': total_refs,
-            'references_by_path': dict(refs_by_type),
+            'total_references': self._total_ref_count,
+            'references_by_path': refs_by_type,
             'orphan_examples': orphan_refs[:20]
         }
 
     def compute_temporal_stats(self) -> Dict[str, Any]:
-        """Compute temporal statistics."""
-        # Date ranges per patient
-        patient_date_ranges = defaultdict(list)
-        resource_type_dates = defaultdict(list)
-
-        for temp in self.temporal_data:
-            effective = temp.effective_date or temp.period_start
-            if effective:
-                resource_type_dates[temp.resource_type].append(effective)
-                if temp.patient_id:
-                    patient_date_ranges[temp.patient_id].append(effective)
-
-        # Calculate per-patient spans
+        """Compute temporal statistics from pre-aggregated per-patient and per-type data."""
         patient_spans = []
-        for patient_id, dates in patient_date_ranges.items():
-            if len(dates) >= 2:
-                min_date = min(dates)
-                max_date = max(dates)
-                span_days = (max_date - min_date).days
-                patient_spans.append(span_days)
+        for min_d, max_d in self._temporal_by_patient.values():
+            if min_d and max_d:
+                patient_spans.append((max_d - min_d).days)
 
-        # Calculate per-resource-type date ranges
         type_ranges = {}
-        for rt, dates in resource_type_dates.items():
-            if dates:
+        for rt, slot in self._temporal_by_type.items():
+            min_d, max_d, cnt = slot
+            if min_d and max_d and cnt > 0:
                 type_ranges[rt] = {
-                    'count': len(dates),
-                    'earliest': min(dates).isoformat(),
-                    'latest': max(dates).isoformat()
+                    'count': cnt,
+                    'earliest': min_d.isoformat(),
+                    'latest': max_d.isoformat()
                 }
 
         return {
-            'resources_with_dates': len(self.temporal_data),
-            'patients_with_date_data': len(patient_date_ranges),
+            'resources_with_dates': self._temporal_count,
+            'patients_with_date_data': len(self._temporal_by_patient),
             'patient_record_span_days': {
                 'min': min(patient_spans) if patient_spans else 0,
                 'max': max(patient_spans) if patient_spans else 0,
@@ -1333,9 +1346,7 @@ class Aggregator:
         self.total_resources: int = 0
         self.errors: List[str] = []
         self.relational = RelationalAnalyzer()
-        # Tracks (resourceType, id) pairs already processed to prevent double-counting
-        # resources that appear in multiple patient bundles (e.g. shared Medication records)
-        self.seen_resource_ids: Set[Tuple[str, str]] = set()
+        # known_ids (inside relational) is reused for dedup — no separate seen_resource_ids needed
         self.dedup_counts: Counter = Counter()  # per-type count of skipped duplicates
 
     def _get_or_create_resource_type(self, resource_type: str) -> ResourceTypeStatistics:
@@ -1359,16 +1370,19 @@ class Aggregator:
         if resource_type in self.config.skip_types:
             return
 
-        # Deduplicate by (resourceType, id): the same resource can appear in multiple
-        # patient bundles (e.g. a shared Medication record). Without this check it
-        # would be counted once per bundle, inflating totals.
         resource_id = resource.get('id')
         if resource_id:
-            dedup_key = (resource_type, resource_id)
-            if dedup_key in self.seen_resource_ids:
-                self.dedup_counts[resource_type] += 1
-                return
-            self.seen_resource_ids.add(dedup_key)
+            if resource_type in self.config.dedup_types:
+                # Shared resource: check for duplicates across patient bundles
+                rt_ids = self.relational.known_ids[resource_type]
+                if resource_id in rt_ids:
+                    self.dedup_counts[resource_type] += 1
+                    return
+                rt_ids.add(resource_id)
+            elif resource_type in self.config.integrity_types:
+                # Reference target: track ID for integrity checks, no dedup needed
+                self.relational.known_ids[resource_type].add(resource_id)
+            # All other types (Observation, Condition, etc.): no ID tracking
 
         type_stats = self._get_or_create_resource_type(resource_type)
         type_stats.increment_resource_count()
@@ -1376,11 +1390,9 @@ class Aggregator:
 
         paths_seen_in_resource: Set[str] = set()
         analyze = self.config.analyze_relations
-        # Relational state accumulated across the single traversal pass
         local_patient_ref: Optional[str] = None
         local_encounter_ref: Optional[str] = None
         resource_max_depth: int = 0
-        # prefix length used to strip "ResourceType." from paths for reference_path storage
         rt_prefix_len = len(resource_type) + 1
 
         for path, value, python_type, is_first_in_resource, depth in traverse_resource(
@@ -1394,18 +1406,14 @@ class Aggregator:
                 field_stats.mark_resource_presence()
                 paths_seen_in_resource.add(path)
 
-            # Extract the bare field name from the path for FHIR type detection.
-            # e.g. 'Patient.name[]' → 'name', 'Observation.valueQuantity' → 'valueQuantity'
             field_name = path.rstrip('[]').rsplit('.', 1)[-1]
 
             if python_type not in ('array', 'object'):
                 field_stats.add_value(value, python_type)
-                # Layer 1 (string narrowing) gives specific primitive types for scalars
                 field_stats.fhir_types[detect_fhir_type(value, field_name)] += 1
             elif python_type == 'object':
                 field_stats.types_seen[python_type] += 1
                 field_stats.value_count += 1
-                # Layer 1 (dict fingerprinting) + Layer 2 (field name) for complex types
                 field_stats.fhir_types[detect_fhir_type(value, field_name)] += 1
             else:  # array
                 field_stats.types_seen[python_type] += 1
@@ -1423,16 +1431,15 @@ class Aggregator:
             elif python_type == 'object' and 'reference' in value:
                 ref_value = value['reference']
                 target_type, target_id = parse_fhir_reference(ref_value)
-                # Strip the leading "ResourceType." prefix to match the original path format
                 ref_path = path[rt_prefix_len:] if len(path) > rt_prefix_len else ''
-                self.relational.references.append(ReferenceInfo(
+                self.relational.add_reference(
                     source_type=resource_type,
                     source_id=resource_id or 'unknown',
-                    reference_path=ref_path,
+                    ref_path=ref_path,
                     target_type=target_type,
                     target_id=target_id,
                     raw_reference=ref_value
-                ))
+                )
                 if target_type == 'Patient':
                     local_patient_ref = target_id
                 elif target_type == 'Encounter':
@@ -1440,7 +1447,6 @@ class Aggregator:
 
         # ── post-traversal relational updates ─────────────────────────────────
         if analyze:
-            self.relational.register_resource(resource)
             self.relational.extract_temporal(resource)
             self.relational.max_depths[resource_type].append(resource_max_depth)
 
@@ -1456,6 +1462,27 @@ class Aggregator:
 
             if resource_type == 'Encounter' and local_patient_ref and resource_id:
                 self.relational.encounter_to_patient[resource_id] = local_patient_ref
+                self.relational.patient_to_encounters[local_patient_ref].add(resource_id)
+
+    def flush_patient_cardinality(self, patient_id: str) -> None:
+        """Move a completed patient's cardinality counts into compact CardinalityStats arrays."""
+        rel = self.relational
+
+        for rt in list(rel.cardinality_by_patient.keys()):
+            count = rel.cardinality_by_patient[rt].pop(patient_id, None)
+            if count is not None:
+                rel._get_or_create_cardinality_stats(rt, 'per_patient').add(count)
+            if not rel.cardinality_by_patient[rt]:
+                del rel.cardinality_by_patient[rt]
+
+        for enc_id in rel.patient_to_encounters.pop(patient_id, set()):
+            for rt in list(rel.cardinality_by_encounter.keys()):
+                count = rel.cardinality_by_encounter[rt].pop(enc_id, None)
+                if count is not None:
+                    rel._get_or_create_cardinality_stats(rt, 'per_encounter').add(count)
+        for rt in list(rel.cardinality_by_encounter.keys()):
+            if not rel.cardinality_by_encounter[rt]:
+                del rel.cardinality_by_encounter[rt]
 
     def process_resources(self, resources: List[Dict[str, Any]]) -> None:
         for resource in resources:
@@ -1939,9 +1966,10 @@ def run_profiler(config: ProfilerConfig) -> dict:
                     session, config.server_base_url, patient_id,
                     config.page_size, fetch_errors, config.max_retries):
                 aggregator.process_resource(resource)
+            aggregator.flush_patient_cardinality(patient_id)
             aggregator.mark_file_processed()
 
-            if verbose and (idx % 10 == 0 or idx == effective_limit):
+            if verbose and (idx % 500 == 0 or idx == effective_limit):
                 elapsed_so_far = time.time() - start_time
                 pat_per_sec = idx / elapsed_so_far if elapsed_so_far > 0 else 0
                 eta_sec = (effective_limit - idx) / pat_per_sec if (pat_per_sec > 0 and effective_limit) else 0
@@ -2026,8 +2054,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
 # CLI ENTRY POINT
 # =============================================================================
 
-def \
-        main():
+def main():
     parser = argparse.ArgumentParser(
         description='Profile a FHIR R4 server via $everything for all patients.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2053,11 +2080,22 @@ Examples:
     parser.add_argument('--no-relations', action='store_true', help='Skip relational analysis')
     parser.add_argument('--skip-types', type=str, default='',
                         help='Comma-separated resource types to exclude (e.g. Binary,DocumentReference)')
+    parser.add_argument('--dedup-types', type=str, default='Medication,Location',
+                        help='Resource types that may appear in multiple patient bundles and need '
+                             'deduplication (default: Medication,Location)')
+    parser.add_argument('--integrity-types', type=str,
+                        default='Patient,Encounter,Practitioner,PractitionerRole,'
+                                'Organization,Device,RelatedPerson,Coverage',
+                        help='Resource types tracked in known_ids for reference integrity '
+                             'but not deduplicated (default: common FHIR reference targets)')
     parser.add_argument('--run-name', type=str, default=None,
                         help='Custom name for the output subfolder (default: timestamp)')
     parser.add_argument('--quiet', '-q', action='store_true', help='Suppress output')
 
     args = parser.parse_args()
+
+    def _parse_types(s: str) -> Set[str]:
+        return {t.strip() for t in s.split(',') if t.strip()}
 
     config = ProfilerConfig(
         server_base_url=args.server_url,
@@ -2072,7 +2110,9 @@ Examples:
         hll_threshold=args.hll_threshold,
         inline_extensions=not args.no_inline_extensions,
         analyze_relations=not args.no_relations,
-        skip_types={t.strip() for t in args.skip_types.split(',') if t.strip()},
+        skip_types=_parse_types(args.skip_types),
+        dedup_types=_parse_types(args.dedup_types),
+        integrity_types=_parse_types(args.integrity_types),
         run_name=args.run_name,
         verbose=not args.quiet
     )
