@@ -17,7 +17,7 @@ Both scripts share the same statistics engine, relational analysis, and export l
 
 ### When to use `profiler_file.py`
 
-Use the file-based profiler when you have a local FHIR export (e.g. a Synthea dataset, a MII bulk export, or any collection of FHIR JSON/NDJSON bundles). It profiles **everything in the files**, regardless of whether a resource is linked to a patient or not — including `Organization`, `Practitioner`, `Location`, `ValueSet`, `CodeSystem`, and standalone `Medication` entries.
+Use the file-based profiler when you have a local FHIR export or any collection of FHIR JSON/NDJSON bundles. It profiles **everything in the files**, regardless of whether a resource is linked to a patient or not — including `Organization`, `Practitioner`, `Location`, `ValueSet`, `CodeSystem`, and standalone `Medication` entries.
 
 ### When to use `profiler_server.py`
 
@@ -251,7 +251,6 @@ FHIRScan/
 ├── Code/
 │   ├── profiler_file.py      # File-based profiler (JSON / NDJSON)
 │   ├── profiler_server.py    # Server-based profiler (FHIR REST API)
-│   ├── profiler_legacy.py    # Deprecated — use profiler_file.py
 │   ├── diz_comparison.ipynb  # DIZ comparison notebook
 │   └── README.md
 └── .gitignore
