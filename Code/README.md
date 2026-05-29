@@ -150,6 +150,7 @@ Each run writes to its own subfolder under `<output_dir>/` (named by timestamp o
 
 | File | Content |
 |------|---------|
+| `00_run_summary.txt` | Human-readable run summary — timestamps, elapsed time, configuration, per-type resource counts, and a list of all output files; written at the end of every run |
 | `01_summary.csv` | One row per resource type — counts, linkage, averages, field completeness |
 | `02_summary_details.csv` | One row per field per resource type — presence category and type consistency |
 | `03_cardinality.csv` | Distribution of resources per patient and per encounter (min/max/mean/percentiles) |

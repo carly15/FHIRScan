@@ -59,6 +59,7 @@ Named classes and functions are also listed in your IDE's Outline/Structure pane
     ├── EXPORT FUNCTIONS ───── export_resource_type_csv · export_cardinality_csv
     │                          export_data_quality_csv · export_summary_csv
     │                          export_summary_details_csv · export_all_results
+    │                          _format_elapsed · write_run_summary
     ├── MAIN PROFILER ──────── run_profiler
     └── CLI ENTRY POINT ────── main()
 """
@@ -75,7 +76,7 @@ from pathlib import Path
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 import array
 import statistics
 try:
@@ -1812,6 +1813,102 @@ def export_all_results(
     return output_files
 
 
+def _format_elapsed(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m > 0:
+        return f"{m}m {s:02d}s"
+    return f"{seconds:.1f}s"
+
+
+def write_run_summary(
+        output_dir: Path,
+        run_name: str,
+        run_start: datetime,
+        elapsed: float,
+        config: ProfilerConfig,
+        scan_result: ScanResult,
+        summary: dict,
+        relational: RelationalAnalyzer,
+        dedup_counts: Counter,
+        all_errors: List[str],
+        output_files: dict,
+) -> Path:
+    """Write a human-readable run summary to 00_run_summary.txt."""
+    output_file = output_dir / "00_run_summary.txt"
+    run_end = run_start + timedelta(seconds=elapsed)
+    unique_patients = len(relational.known_ids.get('Patient', set()))
+    unique_encounters = len(relational.known_ids.get('Encounter', set()))
+
+    lines: List[str] = []
+
+    def _section(title: str) -> None:
+        lines.append("")
+        lines.append(title)
+        lines.append("-" * len(title))
+
+    lines.append("RUN SUMMARY — FHIRscan File Profiler")
+    lines.append("=" * 40)
+    lines.append(f"Run name:  {run_name}")
+    lines.append(f"Started:   {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Finished:  {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Elapsed:   {_format_elapsed(elapsed)}")
+
+    _section("INPUT")
+    size_mb = scan_result.total_size_bytes / (1024 * 1024)
+    lines.append(f"Directory:  {config.input_dir}")
+    lines.append(f"Files:      {len(scan_result.files):,} ({size_mb:.2f} MB)")
+
+    _section("CONFIGURATION")
+    lines.append(f"Top-N values:        {config.top_values_limit}")
+    lines.append(f"Relational analysis: {'enabled' if config.analyze_relations else 'disabled'}")
+    lines.append(f"Skip types:          {', '.join(sorted(config.skip_types)) or '(none)'}")
+    lines.append(f"Inline extensions:   {'enabled' if config.inline_extensions else 'disabled'}")
+    lines.append(f"HLL precision:       {config.hll_precision}")
+
+    _section("RESULTS")
+    lines.append(f"Files processed:    {summary['files_processed']:,}")
+    lines.append(f"Total resources:    {summary['total_resources']:,}")
+    lines.append(f"Resource types:     {len(summary['resource_types'])}")
+    lines.append(f"Unique patients:    {unique_patients:,}")
+    lines.append(f"Unique encounters:  {unique_encounters:,}")
+
+    type_counts = sorted(summary['resource_type_counts'].items(), key=lambda x: -x[1])
+    if type_counts:
+        lines.append("")
+        lines.append("Resource type counts:")
+        max_name = max(len(rt) for rt, _ in type_counts)
+        for rt, count in type_counts:
+            lines.append(f"  {rt:<{max_name}}  {count:>12,}")
+
+    if dedup_counts:
+        lines.append("")
+        lines.append("Deduplications (skipped as duplicate):")
+        for rt, count in sorted(dedup_counts.items()):
+            lines.append(f"  {rt}: {count:,}")
+
+    _section("ERRORS")
+    lines.append(f"Total: {len(all_errors)}")
+    if all_errors:
+        lines.append("")
+        for err in all_errors[:20]:
+            lines.append(f"  {err}")
+        if len(all_errors) > 20:
+            lines.append(f"  ... and {len(all_errors) - 20} more (see 99_errors.txt)")
+
+    _section("OUTPUT FILES")
+    for _, path in sorted(output_files.items()):
+        lines.append(f"  {path.name}")
+
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+        f.write("\n")
+
+    return output_file
+
+
 # =============================================================================
 # MAIN PROFILER
 # =============================================================================
@@ -1819,9 +1916,10 @@ def export_all_results(
 def run_profiler(config: ProfilerConfig) -> dict:
     """Run the FHIR dataset profiler with relational analysis."""
     start_time = time.time()
+    run_start = datetime.now()
     verbose = config.verbose
 
-    folder_name = config.run_name if config.run_name else datetime.now().strftime("%Y%m%d_%H_%M")
+    folder_name = config.run_name if config.run_name else run_start.strftime("%Y%m%d_%H_%M")
     timestamped_output_dir = config.output_dir / folder_name
 
     if not _check_output_writable(config.output_dir):
@@ -1893,10 +1991,26 @@ def run_profiler(config: ProfilerConfig) -> dict:
         with open(error_file, 'w', encoding='utf-8') as f:
             for error in all_errors:
                 f.write(f"{error}\n")
+        output_files['_errors'] = error_file
         if verbose:
             print(f"\nErrors written to: {error_file}")
 
     elapsed = time.time() - start_time
+
+    summary_file = write_run_summary(
+        output_dir=timestamped_output_dir,
+        run_name=folder_name,
+        run_start=run_start,
+        elapsed=elapsed,
+        config=config,
+        scan_result=scan_result,
+        summary=summary,
+        relational=relational,
+        dedup_counts=dedup_counts,
+        all_errors=all_errors,
+        output_files=output_files,
+    )
+    output_files['_run_summary'] = summary_file
 
     if verbose:
         print(f"\nDone! Elapsed time: {elapsed:.2f} seconds")
