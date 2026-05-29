@@ -50,6 +50,7 @@ Optionen
     --page-size N         Ressourcen pro Seite (Standard: 100)
     --skip-types TYPEN    Kommagetrennte Ressourcentypen ausschließen (z. B. Binary)
     --run-name NAME       Eigener Name für den Ausgabeordner (Standard: Zeitstempel)
+    --workers N           Parallele Fetch-Threads (Standard: 1 = sequenziell)
     --no-relations        Relationale Analyse deaktivieren
     --quiet               Keine Fortschrittsausgabe
 
@@ -88,6 +89,8 @@ import math
 import hashlib
 import argparse
 import re
+import concurrent.futures
+import threading
 import requests
 from pathlib import Path
 from collections import Counter, defaultdict
@@ -148,6 +151,8 @@ class ProfilerConfig:
     # Relational analysis settings
     analyze_relations: bool = True
     primary_anchors: tuple = ("Patient", "Encounter")  # Main entities to pivot around
+
+    workers: int = 1            # parallel fetch threads; 1 = sequential (default)
 
     def __post_init__(self):
         self.server_base_url = self.server_base_url.rstrip('/')
@@ -1274,6 +1279,33 @@ def fetch_patient_resources(
             errors.append(f"Error fetching Patient/{patient_id}: {e}")
 
 
+_thread_local = threading.local()
+
+
+def _fetch_patient_bundle(
+        auth_token: Optional[str],
+        base_url: str,
+        patient_id: str,
+        page_size: int,
+        max_retries: int,
+        request_delay: float,
+) -> Tuple[str, List[Dict], List[str]]:
+    """Fetch all resources for one patient. Worker function for the prefetch thread pool.
+
+    Each worker thread reuses its own session (thread-local) to avoid the overhead of
+    creating a new connection pool for every patient while keeping threads independent.
+    """
+    if not hasattr(_thread_local, 'session'):
+        _thread_local.session = make_session(auth_token)
+    errors: List[str] = []
+    resources = list(fetch_patient_resources(
+        _thread_local.session, base_url, patient_id, page_size, errors, max_retries
+    ))
+    if request_delay > 0:
+        time.sleep(request_delay)
+    return patient_id, resources, errors
+
+
 # =============================================================================
 # PATH TRAVERSAL
 # =============================================================================
@@ -2065,38 +2097,114 @@ def run_profiler(config: ProfilerConfig) -> dict:
     if verbose:
         print(f"\nFetching and processing patients...")
 
-    for idx, patient_id in enumerate(
-            fetch_patient_ids(session, config.server_base_url, config.page_size, config.max_retries), 1):
-        try:
-            for resource in fetch_patient_resources(
-                    session, config.server_base_url, patient_id,
-                    config.page_size, fetch_errors, config.max_retries):
-                aggregator.process_resource(resource)
-            aggregator.flush_patient_cardinality(patient_id)
-            aggregator.mark_file_processed()
+    patient_id_iter = fetch_patient_ids(
+        session, config.server_base_url, config.page_size, config.max_retries
+    )
+    idx = 0
 
-            if verbose and (idx % 500 == 0 or idx == effective_limit):
-                elapsed_so_far = time.time() - start_time
-                pat_per_sec = idx / elapsed_so_far if elapsed_so_far > 0 else 0
-                eta_sec = (effective_limit - idx) / pat_per_sec if (pat_per_sec > 0 and effective_limit) else 0
-                _, peak_bytes = tracemalloc.get_traced_memory()
-                summary = aggregator.get_summary()
-                print(f"  [{idx}/{effective_limit or '?'}] "
-                      f"Resources: {summary['total_resources']:,} | "
-                      f"{pat_per_sec:.1f} pat/s | "
-                      f"ETA: {eta_sec / 60:.1f} min | "
-                      f"Peak RAM: {peak_bytes / 1024 / 1024:.0f} MB")
+    if config.workers > 1:
+        if verbose:
+            print(f"  (prefetch pipeline: {config.workers} fetch workers)")
+        max_in_flight = config.workers * 2
+        active: Dict[concurrent.futures.Future, str] = {}
+        submitted = 0
 
-            if config.patient_limit and idx >= config.patient_limit:
-                if verbose:
-                    print(f"\n  Patient limit of {config.patient_limit:,} reached — stopping.")
-                break
+        with concurrent.futures.ThreadPoolExecutor(max_workers=config.workers) as executor:
+            def _submit_next() -> bool:
+                nonlocal submitted
+                if config.patient_limit and submitted >= config.patient_limit:
+                    return False
+                try:
+                    pid = next(patient_id_iter)
+                    f = executor.submit(
+                        _fetch_patient_bundle,
+                        config.auth_token, config.server_base_url, pid,
+                        config.page_size, config.max_retries, config.request_delay,
+                    )
+                    active[f] = pid
+                    submitted += 1
+                    return True
+                except StopIteration:
+                    return False
 
-            if config.request_delay > 0:
-                time.sleep(config.request_delay)
+            for _ in range(max_in_flight):
+                if not _submit_next():
+                    break
 
-        except Exception as e:
-            fetch_errors.append(f"Fatal error processing Patient/{patient_id}: {e}")
+            limit_reached = False
+            while active and not limit_reached:
+                done, _ = concurrent.futures.wait(
+                    active, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    patient_id = active.pop(future)
+                    try:
+                        _, resources, errors = future.result()
+                        fetch_errors.extend(errors)
+                        for resource in resources:
+                            aggregator.process_resource(resource)
+                        aggregator.flush_patient_cardinality(patient_id)
+                        aggregator.mark_file_processed()
+                    except Exception as e:
+                        fetch_errors.append(f"Fatal error processing Patient/{patient_id}: {e}")
+
+                    idx += 1
+                    if verbose and (idx % 500 == 0 or idx == effective_limit):
+                        elapsed_so_far = time.time() - start_time
+                        pat_per_sec = idx / elapsed_so_far if elapsed_so_far > 0 else 0
+                        eta_sec = (effective_limit - idx) / pat_per_sec if (pat_per_sec > 0 and effective_limit) else 0
+                        _, peak_bytes = tracemalloc.get_traced_memory()
+                        summary = aggregator.get_summary()
+                        print(f"  [{idx}/{effective_limit or '?'}] "
+                              f"Resources: {summary['total_resources']:,} | "
+                              f"{pat_per_sec:.1f} pat/s | "
+                              f"ETA: {eta_sec / 60:.1f} min | "
+                              f"Peak RAM: {peak_bytes / 1024 / 1024:.0f} MB")
+
+                    if config.patient_limit and idx >= config.patient_limit:
+                        if verbose:
+                            print(f"\n  Patient limit of {config.patient_limit:,} reached — stopping.")
+                        limit_reached = True
+                        for f in list(active):
+                            f.cancel()
+                        active.clear()
+                        break
+
+                    if not limit_reached:
+                        _submit_next()
+    else:
+        for patient_id in patient_id_iter:
+            idx += 1
+            try:
+                for resource in fetch_patient_resources(
+                        session, config.server_base_url, patient_id,
+                        config.page_size, fetch_errors, config.max_retries):
+                    aggregator.process_resource(resource)
+                aggregator.flush_patient_cardinality(patient_id)
+                aggregator.mark_file_processed()
+
+                if verbose and (idx % 500 == 0 or idx == effective_limit):
+                    elapsed_so_far = time.time() - start_time
+                    pat_per_sec = idx / elapsed_so_far if elapsed_so_far > 0 else 0
+                    eta_sec = (effective_limit - idx) / pat_per_sec if (pat_per_sec > 0 and effective_limit) else 0
+                    _, peak_bytes = tracemalloc.get_traced_memory()
+                    summary = aggregator.get_summary()
+                    print(f"  [{idx}/{effective_limit or '?'}] "
+                          f"Resources: {summary['total_resources']:,} | "
+                          f"{pat_per_sec:.1f} pat/s | "
+                          f"ETA: {eta_sec / 60:.1f} min | "
+                          f"Peak RAM: {peak_bytes / 1024 / 1024:.0f} MB")
+
+                if config.patient_limit and idx >= config.patient_limit:
+                    if verbose:
+                        print(f"\n  Patient limit of {config.patient_limit:,} reached — stopping.")
+                    break
+
+                if config.request_delay > 0:
+                    time.sleep(config.request_delay)
+
+            except Exception as e:
+                fetch_errors.append(f"Fatal error processing Patient/{patient_id}: {e}")
 
     _, peak_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
@@ -2213,6 +2321,11 @@ Examples:
                              'but not deduplicated (default: common FHIR reference targets)')
     parser.add_argument('--run-name', type=str, default=None,
                         help='Custom name for the output subfolder (default: timestamp)')
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Parallel fetch threads (default: 1 = sequential). '
+                             'With N>1, N threads fetch patient resources concurrently '
+                             'while the main thread processes them. '
+                             '--request-delay applies per worker thread.')
     parser.add_argument('--quiet', '-q', action='store_true', help='Suppress output')
 
     args = parser.parse_args()
@@ -2237,6 +2350,7 @@ Examples:
         dedup_types=_parse_types(args.dedup_types),
         integrity_types=_parse_types(args.integrity_types),
         run_name=args.run_name,
+        workers=args.workers,
         verbose=not args.quiet
     )
 

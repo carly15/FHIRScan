@@ -121,6 +121,9 @@ python profiler_server.py http://localhost:8080/fhir ./output --limit 100 --requ
 # With authentication
 python profiler_server.py http://myserver/fhir ./output --token <bearer_token>
 
+# Parallel fetch — 4 threads fetch patient bundles while the main thread processes
+python profiler_server.py http://localhost:8080/fhir ./output --workers 4
+
 # Skip large binary resources
 python profiler_server.py http://localhost:8080/fhir ./output --skip-types Binary
 ```
@@ -129,7 +132,8 @@ python profiler_server.py http://localhost:8080/fhir ./output --skip-types Binar
 |------|-------------|---------|
 | `--token TOKEN` | Bearer token for authentication | none |
 | `--limit N` | Stop after N patients (for test runs) | all |
-| `--request-delay SEC` | Pause between patients to avoid overloading the server | 0 |
+| `--request-delay SEC` | Pause between patients per worker thread to avoid overloading the server | 0 |
+| `--workers N` | Parallel fetch threads; N threads fetch patient bundles concurrently while the main thread processes them | 1 |
 | `--max-retries N` | Retry attempts for transient server errors (429, 5xx) | 3 |
 | `--page-size N` | Resources per page for pagination | 100 |
 | `--top-n N` | Most frequent values to track per field | 20 |
