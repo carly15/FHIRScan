@@ -235,3 +235,13 @@ Developed and tested with the MII FHIR test data from the Medizininformatik-Init
 
 
 With generous help from the [Date Integration Centre Würzburg](https://github.com/ukwdiz) in testing the server version 🫶🏼
+
+---
+
+## License
+
+Copyright (C) 2026 Carla Schlüter, Bavarian Health Cloud GmbH
+
+This project is licensed under the MIT License — see the [LICENSE](../LICENSE) file for details.
+
+For questions about usage or collaboration: carla.schlueter@bavarian-health-cloud.de

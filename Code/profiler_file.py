@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Carla Schlüter, Bavarian Health Cloud GmbH
+# SPDX-License-Identifier: MIT
 """
 FHIRscan — FHIR Dataset Profiler
 =================================
