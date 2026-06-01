@@ -232,3 +232,6 @@ FHIRScan/
 
 Developed and tested with the MII FHIR test data from the Medizininformatik-Initiative:
 [kerndatensatz-testdaten](https://github.com/medizininformatik-initiative/kerndatensatz-testdaten/tree/master)
+
+
+With generous help from the [Date Integration Centre Würzburg](https://github.com/ukwdiz) in testing the server version 🫶🏼
