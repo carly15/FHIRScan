@@ -116,3 +116,11 @@ Checks whether resources are properly linked to patients and encounters.
 **`presence_rate = 1.0` does not mean the value is meaningful**
 
 A field can be present in every resource but still contain a placeholder or default value. Use `top_values` and `unique_count` to assess whether the content is substantively populated.
+
+## License
+
+Copyright (C) 2026 Carla Schlüter, Bavarian Health Cloud GmbH
+
+This project is licensed under the MIT License — see the [LICENSE](../LICENSE) file for details.
+
+For questions about usage or collaboration: carla.schlueter@bavarian-health-cloud.de
