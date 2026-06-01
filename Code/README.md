@@ -162,46 +162,10 @@ Each run writes to its own subfolder under `<output_dir>/` (named by timestamp o
 | `05_reference_integrity.txt` | Orphan reference analysis — dangling references by source and target type |
 | `06_temporal_analysis.txt` | Date ranges per resource type and patient record span statistics |
 | `07_structural_analysis.txt` | Nesting depth and array size statistics per resource type |
-| `<ResourceType>_fields.csv` | Field-level statistics per resource type — see column details below |
+| `<ResourceType>_fields.csv` | Field-level statistics per resource type |
 | `99_errors.txt` | Parse or fetch errors (only written if errors occurred) |
 
-### `<ResourceType>_fields.csv` columns
-
-| Column | Description |
-|--------|-------------|
-| `field_path` | Full dot-notation path (e.g. `Observation.code.coding[].system`) |
-| `resources_with_field` | How many resources contained this field at least once |
-| `total_resources` | Total resources of this type |
-| `presence_rate` | `resources_with_field / total_resources` |
-| `missing_rate` | `1 - presence_rate` |
-| `value_count` | Total values seen (including repeated occurrences) |
-| `unique_count` | Distinct values (exact below threshold, HLL estimate above) |
-| `unique_count_approximate` | `True` if HyperLogLog estimate was used |
-| `detected_python_types` | Python types observed (string, integer, boolean, …) |
-| `detected_fhir_type` | Most frequent FHIR R4B datatype (CodeableConcept, Reference, Period, …) |
-| `type_inconsistency` | `True` if more than one non-null Python type was seen for this field |
-| `numeric_count` | Number of numeric values seen (blank for non-numeric fields) |
-| `numeric_min` | Minimum value |
-| `numeric_max` | Maximum value |
-| `numeric_mean` | Mean (Welford's online algorithm) |
-| `numeric_stdev` | Sample standard deviation |
-| `top_values` | JSON array of `[value, count]` pairs for the most frequent values; for high-cardinality fields (unique values > HLL threshold) a sample from the first observed values is shown instead |
-
-### `01_summary.csv` columns
-
-| Column | Description |
-|--------|-------------|
-| `resource_type` | FHIR resource type name |
-| `total_resources` | All resources of this type (after deduplication) |
-| `deduplicated_resources` | Resources skipped because the same (type, id) was already seen in another bundle |
-| `patient_linked_resources` | Resources with a direct reference to a Patient (Patient type itself counts as fully linked) |
-| `unlinked_resources` | `total - linked` — these exist in the data but have no patient association |
-| `patient_linkage_rate` | `linked / total` |
-| `avg_resources_per_patient` | `linked / unique_patients` — based on linked resources only |
-| `total_fields` | Number of distinct field paths observed |
-| `fields_always_present` | Fields present in every resource of this type |
-| `fields_sometimes_present` | Fields present in some but not all resources |
-| `fields_with_type_inconsistency` | Fields where more than one non-null Python type was observed |
+For a detailed explanation of every column in each output file, see [METRICS.md](METRICS.md).
 
 ---
 
@@ -257,7 +221,8 @@ FHIRScan/
 │   ├── profiler_file.py      # File-based profiler (JSON / NDJSON)
 │   ├── profiler_server.py    # Server-based profiler (FHIR REST API)
 │   ├── diz_comparison.ipynb  # DIZ comparison notebook
-│   └── README.md
+│   ├── README.md
+│   └── METRICS.md            # Output metrics reference
 └── .gitignore
 ```
 
