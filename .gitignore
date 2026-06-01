@@ -11,7 +11,9 @@ diz_comparison_results/
 
 # Non-code assets (docs, archives, legacy files)
 Stuff/
+Analysis/
 *.zip
+*.scpt
 
 # macOS
 .DS_Store
