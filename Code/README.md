@@ -70,8 +70,6 @@ If any of the above matters for your analysis, export the data first and use `pr
 - Python 3.9+
 - `requests` — required for `profiler_server.py` only (`pip install requests`)
 
-> On Python 3.8 (end-of-life), install `backports.zoneinfo` as well (`pip install backports.zoneinfo`).
-
 ---
 
 ## Installation
@@ -118,8 +116,11 @@ python profiler_server.py <server_url> <output_dir>
 # Test run — first 100 patients only, gentle on the server
 python profiler_server.py http://localhost:8080/fhir ./output --limit 100 --request-delay 0.5
 
-# With authentication
-python profiler_server.py http://myserver/fhir ./output --token <bearer_token>
+# Bearer token authentication
+python profiler_server.py https://myserver/fhir ./output --token <bearer_token>
+
+# Basic Auth + self-signed certificate
+python profiler_server.py https://myserver/fhir ./output --auth-user admin --auth-password secret --no-verify-ssl
 
 # Parallel fetch — 4 threads fetch patient bundles while the main thread processes
 python profiler_server.py http://localhost:8080/fhir ./output --workers 4
@@ -131,6 +132,9 @@ python profiler_server.py http://localhost:8080/fhir ./output --skip-types Binar
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--token TOKEN` | Bearer token for authentication | none |
+| `--auth-user USER` | Username for Basic Auth | none |
+| `--auth-password PASS` | Password for Basic Auth | none |
+| `--no-verify-ssl` | Disable SSL certificate verification (e.g. for self-signed certs) | off |
 | `--limit N` | Stop after N patients (for test runs) | all |
 | `--request-delay SEC` | Pause between patients per worker thread to avoid overloading the server | 0 |
 | `--workers N` | Parallel fetch threads; N threads fetch patient bundles concurrently while the main thread processes them | 1 |
@@ -143,6 +147,8 @@ python profiler_server.py http://localhost:8080/fhir ./output --skip-types Binar
 | `--no-relations` | Skip relational analysis | off |
 | `--run-name NAME` | Custom output subfolder name instead of timestamp | timestamp |
 | `--quiet` | Suppress progress output | off |
+
+To run from an IDE instead of the terminal, edit the `if __name__ == '__main__':` block at the bottom of `profiler_server.py` — all the same options are available there as named variables.
 
 The server profiler verifies the connection via `/metadata` before processing and prints server name and FHIR version. Progress is reported every 500 patients with throughput, ETA, and peak RAM usage.
 
@@ -203,16 +209,6 @@ Extract resources              GET /Patient/[id]/$everything
 
 ---
 
-## Relational Analysis Dimensions
-
-1. **Cardinality per Anchor** — resources per Patient, resources per Encounter, Encounters per Patient; only patient-linked resources are counted
-2. **Reference Integrity** — orphan references, reference target distribution, unknown target types
-3. **Temporal Depth** — date ranges per resource type, patient record span (earliest to latest dated event)
-4. **Structural Depth** — path nesting depth per resource type, array cardinality statistics
-5. **Completeness Patterns** — field presence rates and type consistency per field path
-
----
-
 ## Project Structure
 
 ```
@@ -234,7 +230,7 @@ Developed and tested with the MII FHIR test data from the Medizininformatik-Init
 [kerndatensatz-testdaten](https://github.com/medizininformatik-initiative/kerndatensatz-testdaten/tree/master)
 
 
-With generous help from the [Date Integration Centre Würzburg](https://github.com/ukwdiz) in testing the server version 🫶🏼
+With generous help from the [Data Integration Centre Würzburg](https://github.com/ukwdiz) in testing the server version 🫶🏼
 
 ---
 

@@ -5,56 +5,51 @@
 FHIRscan — FHIR Server Profiler
 ================================
 
-Verbindet sich mit einem FHIR R4 Server (getestet auf Blaze) und erstellt
-ein umfassendes statistisches Profil über alle Patientenressourcen.
+Connects to a FHIR R4 server (tested on Blaze) and builds a comprehensive
+statistical profile of all patient resources.
 
-Funktionsweise
---------------
-1. **Verbindungscheck**: Prüft den Server via GET /metadata und zeigt
-   Softwarename und FHIR-Version.
-2. **Patientenliste**: Liest alle Patienten-IDs paginiert via GET /Patient.
-3. **Ressourcenabruf**: Ruft für jeden Patienten alle verknüpften Ressourcen
-   via GET /Patient/[id]/$everything ab (paginiert, mit Retry-Logik).
-4. **Feldtraversierung**: Traversiert jeden Ressourceneintrag rekursiv und
-   generiert vollständige Feldpfade (z. B. `subject.reference`, `code.coding[].system`).
-5. **Statistiken**: Akkumuliert je Feldpfad und Ressourcentyp:
-   - Vorkommen und Vollständigkeit (presence rate)
-   - Datentypen (FHIR R4B-spezifisch: CodeableConcept, Reference, Period, ...)
-   - Werteverteilung (Top-N-Werte, Kardinalität via HyperLogLog)
-   - Numerische Kennzahlen (Min, Max, Mittelwert, Standardabweichung)
-6. **Relationale Analyse**:
-   - Kardinalitäten (Ressourcen je Patient / Encounter)
-   - Referenzintegrität (dangling references)
-   - Zeitliche Verteilung der Ressourcen
-   - Strukturtiefe und Komplexitätsmetriken
-   - Data Quality Score je Ressourcentyp
-7. **Export**: Schreibt die Ergebnisse als CSV-Dateien in das Ausgabeverzeichnis.
+How it works
+------------
+1. Connection check via GET /metadata — prints software name and FHIR version.
+2. Fetches all patient IDs paginated via GET /Patient.
+3. For each patient, fetches all linked resources via GET /Patient/[id]/$everything
+   (paginated, with exponential-backoff retry on 429/5xx).
+4. Traverses each resource recursively and generates full field paths
+   (e.g. `subject.reference`, `code.coding[].system`).
+5. Accumulates per field path and resource type:
+   - Presence rate and FHIR R4B data types
+   - Top-N value distribution and cardinality (HyperLogLog)
+   - Numeric statistics (min, max, mean, stdev — Welford's algorithm)
+6. Relational analysis: cardinalities per Patient/Encounter, reference integrity,
+   temporal distribution, structural depth, data quality score.
+7. Exports results as CSV files into the output directory.
 
-Einschränkungen
----------------
-Nur patientenzentrierte Ressourcen werden erfasst.  Der `$everything`-Endpunkt
-liefert ausschließlich Ressourcen, die einem Patienten zugeordnet sind.
-Standalone-Ressourcen wie Organization, Practitioner, Location, ValueSet,
-CodeSystem oder patientenunverknüpfte Medication-Einträge sind für den Profiler
-unsichtbar.  Diese Einschränkung ist bewusst akzeptiert — eine vollständige
-Serverabfrage würde erheblich mehr Anfragen und Verarbeitungszeit erfordern.
+Limitations
+-----------
+Only patient-linked resources are profiled. The $everything endpoint returns
+only resources associated with a specific patient. Standalone resources
+(Organization, Practitioner, Location, ValueSet, CodeSystem, unlinked Medication)
+are invisible to this profiler.
 
-Verwendung
-----------
-    python profiler_server.py <server_url> <output_dir> [Optionen]
+Usage
+-----
+    python profiler_server.py <server_url> <output_dir> [options]
 
-Optionen
---------
-    --token TOKEN         Bearer-Token für Authentifizierung
-    --limit N             Nur die ersten N Patienten verarbeiten (Testlauf)
-    --request-delay SEC   Pause zwischen Patienten in Sekunden (Server schonen)
-    --max-retries N       Wiederholungsversuche bei Serverfehlern (Standard: 3)
-    --page-size N         Ressourcen pro Seite (Standard: 100)
-    --skip-types TYPEN    Kommagetrennte Ressourcentypen ausschließen (z. B. Binary)
-    --run-name NAME       Eigener Name für den Ausgabeordner (Standard: Zeitstempel)
-    --workers N           Parallele Fetch-Threads (Standard: 1 = sequenziell)
-    --no-relations        Relationale Analyse deaktivieren
-    --quiet               Keine Fortschrittsausgabe
+Options
+-------
+    --token TOKEN         Bearer token for authentication
+    --auth-user USER      Username for Basic Auth
+    --auth-password PASS  Password for Basic Auth
+    --no-verify-ssl       Disable SSL certificate verification (self-signed certs)
+    --limit N             Stop after N patients (test runs)
+    --request-delay SEC   Pause between patients in seconds (server throttling)
+    --max-retries N       Retry attempts for transient errors (default: 3)
+    --page-size N         Resources per page (default: 100)
+    --skip-types TYPES    Comma-separated resource types to exclude (e.g. Binary)
+    --run-name NAME       Custom output subfolder name (default: timestamp)
+    --workers N           Parallel fetch threads (default: 1 = sequential)
+    --no-relations        Skip relational analysis
+    --quiet               Suppress progress output
 
 Contents
 --------
@@ -119,7 +114,10 @@ class ProfilerConfig:
 
     server_base_url: str       # e.g. "http://localhost:8080/fhir"
     output_dir: Path
-    auth_token: Optional[str] = None   # Bearer token; None for unauthenticated local servers
+    auth_token: Optional[str] = None     # Bearer token; None for unauthenticated local servers
+    auth_user: Optional[str] = None      # Username for Basic Auth
+    auth_password: Optional[str] = None  # Password for Basic Auth
+    verify_ssl: bool = True              # Set False for self-signed certificates
     page_size: int = 100               # resources per page for Patient and $everything queries
     patient_limit: Optional[int] = None  # stop after N patients (None = all); for test runs
     request_delay: float = 0.0          # seconds to wait between patients; use to avoid overloading the server
@@ -1158,13 +1156,24 @@ class RelationalAnalyzer:
 # SERVER CONNECTION
 # =============================================================================
 
-def make_session(auth_token: Optional[str] = None) -> requests.Session:
-    """Create an HTTP session with FHIR JSON headers and optional Bearer auth."""
+def make_session(
+        auth_token: Optional[str] = None,
+        auth_user: Optional[str] = None,
+        auth_password: Optional[str] = None,
+        verify_ssl: bool = True,
+) -> requests.Session:
+    """Create an HTTP session with FHIR JSON headers and optional auth."""
     session = requests.Session()
     session.headers['Accept'] = 'application/fhir+json'
     session.headers['Content-Type'] = 'application/fhir+json'
     if auth_token:
         session.headers['Authorization'] = f'Bearer {auth_token}'
+    if auth_user and auth_password:
+        session.auth = (auth_user, auth_password)
+    session.verify = verify_ssl
+    if not verify_ssl:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     return session
 
 
@@ -1286,6 +1295,9 @@ _thread_local = threading.local()
 
 def _fetch_patient_bundle(
         auth_token: Optional[str],
+        auth_user: Optional[str],
+        auth_password: Optional[str],
+        verify_ssl: bool,
         base_url: str,
         patient_id: str,
         page_size: int,
@@ -1298,7 +1310,7 @@ def _fetch_patient_bundle(
     creating a new connection pool for every patient while keeping threads independent.
     """
     if not hasattr(_thread_local, 'session'):
-        _thread_local.session = make_session(auth_token)
+        _thread_local.session = make_session(auth_token, auth_user, auth_password, verify_ssl)
     errors: List[str] = []
     resources = list(fetch_patient_resources(
         _thread_local.session, base_url, patient_id, page_size, errors, max_retries
@@ -2073,7 +2085,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
         print("=" * 70)
 
     # Verify server is reachable before doing anything else
-    session = make_session(config.auth_token)
+    session = make_session(config.auth_token, config.auth_user, config.auth_password, config.verify_ssl)
     if not check_server(session, config.server_base_url, verbose):
         return {'error': 'Server unreachable'}
 
@@ -2120,7 +2132,8 @@ def run_profiler(config: ProfilerConfig) -> dict:
                     pid = next(patient_id_iter)
                     f = executor.submit(
                         _fetch_patient_bundle,
-                        config.auth_token, config.server_base_url, pid,
+                        config.auth_token, config.auth_user, config.auth_password,
+                        config.verify_ssl, config.server_base_url, pid,
                         config.page_size, config.max_retries, config.request_delay,
                     )
                     active[f] = pid
@@ -2302,6 +2315,9 @@ Examples:
     parser.add_argument('server_url', type=str, help='Base URL of the FHIR server')
     parser.add_argument('output_dir', type=Path, help='Directory for output files')
     parser.add_argument('--token', type=str, default=None, help='Bearer token for authentication')
+    parser.add_argument('--auth-user', type=str, default=None, help='Username for Basic Auth')
+    parser.add_argument('--auth-password', type=str, default=None, help='Password for Basic Auth')
+    parser.add_argument('--no-verify-ssl', action='store_true', help='Disable SSL certificate verification (e.g. for self-signed certs)')
     parser.add_argument('--limit', type=int, default=None, help='Stop after N patients (for test runs)')
     parser.add_argument('--request-delay', type=float, default=0.0, help='Seconds to wait between patients (default: 0)')
     parser.add_argument('--max-retries', type=int, default=3, help='Retries for transient server errors (default: 3)')
@@ -2339,6 +2355,9 @@ Examples:
         server_base_url=args.server_url,
         output_dir=args.output_dir,
         auth_token=args.token,
+        auth_user=args.auth_user,
+        auth_password=args.auth_password,
+        verify_ssl=not args.no_verify_ssl,
         patient_limit=args.limit,
         request_delay=args.request_delay,
         max_retries=args.max_retries,
@@ -2361,12 +2380,44 @@ Examples:
 
 
 if __name__ == '__main__':
-    # For quick testing - hardcode your values here
-    SERVER_URL = "http://localhost:8080/fhir"  # ← Change this when necessary
-    OUTPUT_DIR = Path("/Users/carlabhc/Documents/Python Projects/FHIR_Dataset_Profiling/Output")  # ← Change this when necessary
+    # -------------------------------------------------------------------------
+    # Configure your run here when starting from the IDE (e.g. PyCharm, VS Code)
+    # -------------------------------------------------------------------------
+    SERVER_URL  = "http://localhost:8080/fhir"   # ← FHIR server base URL
+    OUTPUT_DIR  = Path("./output")               # ← where to write results
 
-    result = run_profiler(
-        ProfilerConfig(server_base_url=SERVER_URL, output_dir=OUTPUT_DIR, verbose=True)
-    )
+    # Authentication — choose one or leave both as None for no auth
+    AUTH_TOKEN    = None          # Bearer token: e.g. "eyJhbGci..."
+    AUTH_USER     = None          # Basic Auth username: e.g. "admin"
+    AUTH_PASSWORD = None          # Basic Auth password: e.g. "secret"
+
+    # SSL
+    VERIFY_SSL = True             # Set False for self-signed certificates
+
+    # Performance
+    WORKERS       = 1             # parallel fetch threads (1 = sequential)
+    REQUEST_DELAY = 0.0           # seconds to wait between patients (server throttling)
+    MAX_RETRIES   = 3             # retry attempts for transient errors (429, 5xx)
+    PAGE_SIZE     = 100           # resources per page
+
+    # Scope
+    PATIENT_LIMIT = None          # stop after N patients; None = all
+    SKIP_TYPES    = set()         # e.g. {"Binary", "DocumentReference"}
+
+    result = run_profiler(ProfilerConfig(
+        server_base_url=SERVER_URL,
+        output_dir=OUTPUT_DIR,
+        auth_token=AUTH_TOKEN,
+        auth_user=AUTH_USER,
+        auth_password=AUTH_PASSWORD,
+        verify_ssl=VERIFY_SSL,
+        workers=WORKERS,
+        request_delay=REQUEST_DELAY,
+        max_retries=MAX_RETRIES,
+        page_size=PAGE_SIZE,
+        patient_limit=PATIENT_LIMIT,
+        skip_types=SKIP_TYPES,
+        verbose=True,
+    ))
 
     print(f"\nResults: {result}")
