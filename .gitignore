@@ -9,6 +9,9 @@ venv/
 Output/
 diz_comparison_results/
 
+# Generierte HTML-Reports
+Reports/
+
 # Non-code assets (docs, archives, legacy files)
 Stuff/
 Analysis/
