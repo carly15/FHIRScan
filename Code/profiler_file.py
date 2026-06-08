@@ -81,6 +81,7 @@ from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 from datetime import datetime, timedelta
 import array
 import statistics
+import tracemalloc
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -1835,6 +1836,7 @@ def write_run_summary(
         summary: dict,
         relational: RelationalAnalyzer,
         dedup_counts: Counter,
+        peak_mb: float,
         all_errors: List[str],
         output_files: dict,
 ) -> Path:
@@ -1857,6 +1859,7 @@ def write_run_summary(
     lines.append(f"Started:   {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Finished:  {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Elapsed:   {_format_elapsed(elapsed)}")
+    lines.append(f"Peak RAM:  {peak_mb:.0f} MB")
 
     _section("INPUT")
     size_mb = scan_result.total_size_bytes / (1024 * 1024)
@@ -1943,6 +1946,8 @@ def run_profiler(config: ProfilerConfig) -> dict:
 
     # Initialize aggregator
     aggregator = Aggregator(config)
+    if not tracemalloc.is_tracing():
+        tracemalloc.start()
 
     # Process files
     if verbose:
@@ -1964,6 +1969,10 @@ def run_profiler(config: ProfilerConfig) -> dict:
         except Exception as e:
             extraction_errors.append(f"Fatal error processing {file_path}: {e}")
 
+    _, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    peak_mb = peak_bytes / 1024 / 1024
+
     # Get results
     results = aggregator.get_results()
     relational = aggregator.get_relational_results()
@@ -1978,6 +1987,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
         print(f"  Resource types:   {len(summary['resource_types'])}")
         print(f"  Unique patients:  {len(relational.known_ids.get('Patient', set())):,}")
         print(f"  Unique encounters:{len(relational.known_ids.get('Encounter', set())):,}")
+        print(f"  Peak RAM:           {peak_mb:.0f} MB")
         print("-" * 50)
 
     # Export all results
@@ -2009,13 +2019,14 @@ def run_profiler(config: ProfilerConfig) -> dict:
         summary=summary,
         relational=relational,
         dedup_counts=dedup_counts,
+        peak_mb=peak_mb,
         all_errors=all_errors,
         output_files=output_files,
     )
     output_files['_run_summary'] = summary_file
 
     if verbose:
-        print(f"\nDone! Elapsed time: {elapsed:.2f} seconds")
+        print(f"\nDone! Elapsed: {elapsed:.2f}s | Peak RAM: {peak_mb:.0f} MB")
         print(f"\nOutput files:")
         for name, path in sorted(output_files.items()):
             print(f"  {path.name}")
@@ -2026,6 +2037,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
         'resource_types': summary['resource_types'],
         'unique_patients': len(relational.known_ids.get('Patient', set())),
         'unique_encounters': len(relational.known_ids.get('Encounter', set())),
+        'peak_ram_mb': round(peak_mb, 1),
         'output_files': output_files,
         'elapsed_seconds': elapsed,
         'error_count': len(all_errors)
