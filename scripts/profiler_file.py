@@ -2095,7 +2095,7 @@ Examples:
 if __name__ == '__main__':
     # For quick testing - hardcode your paths here
     INPUT_DIR = Path("/Users/carlabhc/Documents/Test FHIR Data")  # ← Change this when necessary
-    OUTPUT_DIR = Path("/Users/carlabhc/Documents/Python Projects/FHIR_Dataset_Profiling/Output")  # ← Change this when necessary
+    OUTPUT_DIR = Path("/Users/carlabhc/Documents/Python Projects/FHIR_Dataset_Profiling/output")  # ← Change this when necessary
 
     result = run_profiler(
         ProfilerConfig(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, verbose=True)

@@ -6,15 +6,16 @@ __pycache__/
 venv/
 
 # Profiler output (timestamped runs)
-Output/
-diz_comparison_results/
+output/
+results/
+
+# Raw output files received from DIZ sites
+diz_profiles/
 
 # Generierte HTML-Reports
-Reports/
+reports/
 
-# Non-code assets (docs, archives, legacy files)
-Stuff/
-Analysis/
+# Non-code assets
 *.zip
 *.scpt
 
