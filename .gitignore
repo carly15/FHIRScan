@@ -12,9 +12,6 @@ results/
 # Raw output files received from DIZ sites
 diz_profiles/
 
-# Generierte HTML-Reports
-reports/
-
 # Non-code assets
 *.zip
 *.scpt

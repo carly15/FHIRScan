@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPORT_DIR="$SCRIPT_DIR/../Reports"
+REPORT_DIR="$SCRIPT_DIR/../results"
 NOTEBOOK="$SCRIPT_DIR/diz_comparison.ipynb"
 OUTFILE="FHIRScan_DIZ_Vergleich_$(date +%Y%m%d_%H%M)"
 TMP_NOTEBOOK="$(mktemp).ipynb"
