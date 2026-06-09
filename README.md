@@ -76,7 +76,7 @@ If any of the above matters for your analysis, export the data first and use `pr
 
 ```bash
 git clone https://github.com/carly15/FHIRScan.git
-cd FHIRScan/Code
+cd FHIRScan/scripts
 pip install requests   # only needed for profiler_server.py
 ```
 
@@ -171,7 +171,7 @@ Each run writes to its own subfolder under `<output_dir>/` (named by timestamp o
 | `<ResourceType>_fields.csv` | Field-level statistics per resource type |
 | `99_errors.txt` | Parse or fetch errors (only written if errors occurred) |
 
-For a detailed explanation of every column in each output file, see [METRICS.md](METRICS.md).
+For a detailed explanation of every column in each output file, see [METRICS.md](scripts/METRICS.md).
 
 ---
 
@@ -213,13 +213,18 @@ Extract resources              GET /Patient/[id]/$everything
 
 ```
 FHIRScan/
-├── Code/
-│   ├── profiler_file.py      # File-based profiler (JSON / NDJSON)
-│   ├── profiler_server.py    # Server-based profiler (FHIR REST API)
-│   ├── diz_comparison.ipynb  # DIZ comparison notebook
-│   ├── README.md
-│   └── METRICS.md            # Output metrics reference
-└── .gitignore
+├── README.md
+├── LICENSE
+├── scripts/
+│   ├── profiler_file.py           # File-based profiler (JSON / NDJSON)
+│   ├── profiler_server.py         # Server-based profiler (FHIR REST API)
+│   └── METRICS.md                 # Output metrics reference
+├── heterogeneity_analysis/
+│   └── diz_comparison.ipynb       # Cross-site heterogeneity analysis
+├── output/                        # Local profiling runs — gitignored
+├── diz_profiles/                  # Raw output files from DIZ sites — gitignored
+├── results/                       # Comparison analysis outputs — gitignored
+└── reports/                       # Generated HTML reports — gitignored
 ```
 
 ---
@@ -238,6 +243,6 @@ With generous help from the [Data Integration Centre Würzburg](https://github.c
 
 Copyright (C) 2026 Carla Schlüter, Bavarian Health Cloud GmbH
 
-This project is licensed under the MIT License — see the [LICENSE](../LICENSE) file for details.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
 For questions about usage or collaboration: carla.schlueter@bavarian-health-cloud.de
