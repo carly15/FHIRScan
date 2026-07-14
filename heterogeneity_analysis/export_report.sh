@@ -44,6 +44,25 @@ if command -v quarto &>/dev/null; then
             --output-dir "$REPORT_DIR"
     fi
 
+    # Quarto's embed-resources inlines the full plotly.js (~5 MB) once per
+    # chart instead of once per page. Strip all but the first copy.
+    python3 - "$REPORT_DIR/${OUTFILE}.html" << 'PYEOF'
+import re, sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    html = f.read()
+
+pattern = re.compile(r'<script>/\*\*\s*\*\s*plotly\.js v[\d.]+.*?</script>', re.DOTALL)
+matches = list(pattern.finditer(html))
+if len(matches) > 1:
+    keep = matches[0].group(0)
+    html = pattern.sub(lambda m: keep if m.start() == matches[0].start() else "", html)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"Plotly.js dedupliziert: {len(matches)} → 1 Kopie")
+PYEOF
+
 # ── nbconvert (Fallback bis Quarto installiert ist) ───────────────────────
 else
     echo "Renderer: nbconvert (Fallback — 'brew install quarto' für besseres Output)"
