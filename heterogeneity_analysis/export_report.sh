@@ -33,6 +33,7 @@ if command -v quarto &>/dev/null; then
         echo "Führe Notebook aus und exportiere..."
         quarto render "$NOTEBOOK" \
             --to html \
+            --execute \
             --output "${OUTFILE}.html" \
             --output-dir "$REPORT_DIR"
     else
