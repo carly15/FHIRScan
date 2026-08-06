@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Carla Schlüter, Bavarian Health Cloud GmbH
 # SPDX-License-Identifier: MIT
 """
-FHIRscan — FHIR Dataset Profiler
+FHIRScan — FHIR Dataset Profiler
 =================================
 
 Analysiert FHIR-Datensatze (HL7 FHIR R4B) im JSON- und NDJSON-Format und erstellt
@@ -1853,7 +1853,7 @@ def write_run_summary(
         lines.append(title)
         lines.append("-" * len(title))
 
-    lines.append("RUN SUMMARY — FHIRscan File Profiler")
+    lines.append("RUN SUMMARY — FHIRScan File Profiler")
     lines.append("=" * 40)
     lines.append(f"Run name:  {run_name}")
     lines.append(f"Started:   {run_start.strftime('%Y-%m-%d %H:%M:%S')}")

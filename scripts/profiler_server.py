@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Carla Schlüter, Bavarian Health Cloud GmbH
 # SPDX-License-Identifier: MIT
 """
-FHIRscan — FHIR Server Profiler
+FHIRScan — FHIR Server Profiler
 ================================
 
 Connects to a FHIR R4 server (tested on Blaze) and builds a comprehensive
@@ -1993,7 +1993,7 @@ def write_run_summary(
         lines.append(title)
         lines.append("-" * len(title))
 
-    lines.append("RUN SUMMARY — FHIRscan Server Profiler")
+    lines.append("RUN SUMMARY — FHIRScan Server Profiler")
     lines.append("=" * 40)
     lines.append(f"Run name:  {run_name}")
     lines.append(f"Started:   {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
