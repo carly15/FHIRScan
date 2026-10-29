@@ -52,7 +52,7 @@ Options
     --limit N             Stop after N patients (test runs)
     --request-delay SEC   Pause between patients in seconds (server throttling)
     --max-retries N       Retry attempts for transient errors incl. timeouts (default: 3)
-    --page-size N         Resources per page (default: 100)
+    --page-size N         Resources per page (default: 1000)
     --skip-types TYPES    Comma-separated resource types to exclude (e.g. Binary)
     --run-name NAME       Custom output subfolder name (default: timestamp)
     --workers N           Parallel fetch threads (default: 1 = sequential)
@@ -131,7 +131,7 @@ class ProfilerConfig:
     auth_user: Optional[str] = None      # Username for Basic Auth
     auth_password: Optional[str] = None  # Password for Basic Auth
     verify_ssl: bool = True              # Set False for self-signed certificates
-    page_size: int = 100               # resources per page for Patient and $everything queries
+    page_size: int = 1000              # resources per page for Patient and $everything queries
     patient_limit: Optional[int] = None  # stop after N patients (None = all); for test runs
     request_delay: float = 0.0          # seconds to wait between patients; use to avoid overloading the server
     max_retries: int = 3                 # retry attempts for transient HTTP errors (429, 5xx, timeouts)
@@ -2470,7 +2470,7 @@ Examples:
     parser.add_argument('--limit', type=int, default=None, help='Stop after N patients (for test runs)')
     parser.add_argument('--request-delay', type=float, default=0.0, help='Seconds to wait between patients (default: 0)')
     parser.add_argument('--max-retries', type=int, default=3, help='Retries for transient server errors and timeouts (default: 3)')
-    parser.add_argument('--page-size', type=int, default=100, help='Resources per page (default: 100)')
+    parser.add_argument('--page-size', type=int, default=1000, help='Resources per page (default: 1000)')
     parser.add_argument('--top-n', type=int, default=20, help='Top values to track (default: 20)')
     parser.add_argument('--hll-precision', type=int, default=14, help='HyperLogLog precision (default: 14)')
     parser.add_argument('--hll-threshold', type=int, default=10000, help='HLL switch threshold (default: 10000)')
@@ -2550,7 +2550,7 @@ elif __name__ == '__main__':
     WORKERS       = 1             # parallel fetch threads (1 = sequential)
     REQUEST_DELAY = 0.0           # seconds to wait between patients (server throttling)
     MAX_RETRIES   = 3             # retry attempts for transient errors (429, 5xx)
-    PAGE_SIZE     = 100           # resources per page
+    PAGE_SIZE     = 1000          # resources per page
 
     # Scope
     PATIENT_LIMIT = None          # stop after N patients; None = all

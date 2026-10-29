@@ -140,7 +140,7 @@ python profiler_server.py http://localhost:8080/fhir ./output --skip-types Binar
 | `--request-delay SEC` | Pause between patients per worker thread to avoid overloading the server | 0 |
 | `--workers N` | Parallel fetch threads; N threads fetch patient bundles concurrently while the main thread processes them | 1 |
 | `--max-retries N` | Retry attempts for transient server errors (429, 5xx, timeouts, dropped connections) | 3 |
-| `--page-size N` | Resources per page for pagination | 100 |
+| `--page-size N` | Resources per page for pagination | 1000 |
 | `--top-n N` | Most frequent values to track per field | 20 |
 | `--skip-types TYPES` | Comma-separated resource types to exclude (e.g. `Binary`) | none |
 | `--dedup-types TYPES` | Resource types that may appear in multiple patient bundles and need deduplication | `Medication,Location` |
