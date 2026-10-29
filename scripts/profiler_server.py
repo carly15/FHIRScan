@@ -13,7 +13,8 @@ How it works
 1. Connection check via GET /metadata — prints software name and FHIR version.
 2. Fetches all patient IDs paginated via GET /Patient.
 3. For each patient, fetches all linked resources via GET /Patient/[id]/$everything
-   (paginated, with exponential-backoff retry on 429/5xx).
+   (paginated, with exponential-backoff retry on 429/5xx, timeouts and dropped
+   connections). A patient whose bundle cannot be fetched completely is skipped and logged.
 4. Traverses each resource recursively and generates full field paths
    (e.g. `subject.reference`, `code.coding[].system`).
 5. Accumulates per field path and resource type:
@@ -23,6 +24,13 @@ How it works
 6. Relational analysis: cardinalities per Patient/Encounter, reference integrity,
    temporal distribution, structural depth, data quality score.
 7. Exports results as CSV files into the output directory.
+
+Robustness: errors are appended to 99_errors.txt as they happen. If the run is aborted
+(Ctrl+C, SIGTERM, an unexpected error, or too many consecutive fetch failures such as an
+expired token), partial results are still exported and the run summary is marked ABORTED.
+Only a hard kill (kill -9, OOM killer) prevents the export; 99_errors.txt survives even then.
+
+Requires Python 3.11+ and `requests`. Optional: `orjson` (faster JSON decoding).
 
 Limitations
 -----------
@@ -43,7 +51,7 @@ Options
     --no-verify-ssl       Disable SSL certificate verification (self-signed certs)
     --limit N             Stop after N patients (test runs)
     --request-delay SEC   Pause between patients in seconds (server throttling)
-    --max-retries N       Retry attempts for transient errors (default: 3)
+    --max-retries N       Retry attempts for transient errors incl. timeouts (default: 3)
     --page-size N         Resources per page (default: 100)
     --skip-types TYPES    Comma-separated resource types to exclude (e.g. Binary)
     --run-name NAME       Custom output subfolder name (default: timestamp)
@@ -59,11 +67,12 @@ Named classes and functions are also listed in your IDE's Outline/Structure pane
     profiler_server.py
     ├── CONFIGURATION ──────── ProfilerConfig
     ├── UTILITIES ──────────── get_python_type · _check_output_writable
+    │                          _get_peak_ram_mb · ErrorLog
     ├── FHIR R4B TYPE DETECTION  detect_fhir_type · parse_fhir_reference
     │                            parse_fhir_datetime
     ├── HYPERLOGLOG ────────── HyperLogLog
     ├── FIELD STATISTICS ───── FieldStatistics · ResourceTypeStatistics
-    ├── RELATIONAL STATISTICS  CardinalityStats · RelationalAnalyzer
+    ├── RELATIONAL STATISTICS  CardinalityStats · _histogram_median · RelationalAnalyzer
     ├── SERVER CONNECTION ──── make_session · check_server · _get_with_retry
     │                          _follow_pages · fetch_patient_count
     │                          fetch_patient_ids · fetch_patient_resources
@@ -79,13 +88,14 @@ Named classes and functions are also listed in your IDE's Outline/Structure pane
 
 import sys
 import time
-import tracemalloc
 import json
 import csv
 import math
 import hashlib
 import argparse
 import re
+import signal
+import traceback
 import concurrent.futures
 import threading
 import requests
@@ -96,10 +106,13 @@ from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 from datetime import datetime, timedelta
 import array
 import statistics
+from zoneinfo import ZoneInfo
 try:
-    from zoneinfo import ZoneInfo
+    # Optional: orjson decodes JSON 3-5x faster than the standard library
+    import orjson
+    _json_loads = orjson.loads
 except ImportError:
-    from backports.zoneinfo import ZoneInfo  # type: ignore[import]
+    _json_loads = json.loads
 
 _BERLIN_TZ = ZoneInfo('Europe/Berlin')
 
@@ -121,11 +134,13 @@ class ProfilerConfig:
     page_size: int = 100               # resources per page for Patient and $everything queries
     patient_limit: Optional[int] = None  # stop after N patients (None = all); for test runs
     request_delay: float = 0.0          # seconds to wait between patients; use to avoid overloading the server
-    max_retries: int = 3                 # retry attempts for transient HTTP errors (429, 5xx)
+    max_retries: int = 3                 # retry attempts for transient HTTP errors (429, 5xx, timeouts)
+    max_consecutive_failures: int = 50   # abort (and export partial results) after N patients in a row fail
     top_values_limit: int = 20
     max_value_length: int = 200
     hll_precision: int = 14
     hll_threshold: int = 10000
+    fhir_type_sample_size: int = 1000    # FHIR type detection runs on the first N values per field only
     inline_extensions: bool = True
     verbose: bool = True
     run_name: Optional[str] = None          # custom output subfolder name; defaults to timestamp
@@ -194,6 +209,59 @@ def _check_output_writable(output_dir: Path) -> bool:
     except (PermissionError, OSError) as e:
         print(f"Error: output directory is not writable: {output_dir}\n  {e}")
         return False
+
+
+def _get_peak_ram_mb() -> Optional[float]:
+    """Peak resident memory (RSS) of this process in MB, read from the OS (no overhead).
+
+    Replaces tracemalloc, which hooks every allocation and slowed parsing down several-fold.
+    Returns None on Windows, where the resource module is unavailable.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # ru_maxrss is bytes on macOS, kilobytes on Linux
+    return peak / 1024 / 1024 if sys.platform == 'darwin' else peak / 1024
+
+
+def _format_ram(mb: Optional[float]) -> str:
+    return f"{mb:.0f} MB" if mb is not None else "n/a"
+
+
+class ErrorLog:
+    """Collects errors and appends each one to the error file as it happens.
+
+    Writing immediately means 99_errors.txt survives even if the process is killed
+    (e.g. by the OOM killer) before the final export. Only the first few errors are
+    kept in memory (for the run summary), so a flood of errors cannot exhaust RAM.
+    """
+
+    def __init__(self, path: Optional[Path] = None, keep_in_memory: int = 20):
+        self.path = path
+        self.count = 0
+        self.first: List[str] = []
+        self._keep = keep_in_memory
+        self._fh = None
+
+    def append(self, message: str) -> None:
+        self.count += 1
+        if len(self.first) < self._keep:
+            self.first.append(message)
+        if self.path is not None:
+            if self._fh is None:  # create the file lazily: only written if errors occur
+                self._fh = open(self.path, 'w', encoding='utf-8')
+            self._fh.write(message + '\n')
+            self._fh.flush()
+
+    def __len__(self) -> int:
+        return self.count
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
 
 
 # =============================================================================
@@ -582,29 +650,18 @@ def parse_fhir_datetime(value: str) -> Optional[datetime]:
     if not value or not isinstance(value, str):
         return None
 
-    formats = [
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S.%f%z",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%f",
-        "%Y-%m-%d",
-        "%Y-%m",
-        "%Y"
-    ]
-
-    # Strip the colon from timezone offsets (e.g. "+05:30" → "+0530") for strptime compatibility
-    value_clean = re.sub(r'(\+|-)(\d{2}):(\d{2})$', r'\1\2\3', value)
-
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(value_clean, fmt)
-            if dt.tzinfo is None:
-                return dt.replace(tzinfo=_BERLIN_TZ)   # assume Berlin local time
-            return dt.astimezone(_BERLIN_TZ)            # convert any other TZ to Berlin
-        except ValueError:
-            continue
-
-    return None
+    # FHIR allows partial dates (YYYY, YYYY-MM); pad them to the first day
+    if len(value) == 4:
+        value += '-01-01'
+    elif len(value) == 7:
+        value += '-01'
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_BERLIN_TZ)   # assume Berlin local time
+    return dt.astimezone(_BERLIN_TZ)            # convert any other TZ to Berlin
 
 
 # =============================================================================
@@ -895,6 +952,22 @@ class CardinalityStats:
         }
 
 
+def _histogram_median(hist: Counter) -> float:
+    """Median of a {value: frequency} histogram; same result as statistics.median on the expanded data."""
+    n = sum(hist.values())
+    lo_idx, hi_idx = (n - 1) // 2, n // 2
+    lo = hi = None
+    seen = 0
+    for value in sorted(hist):
+        seen += hist[value]
+        if lo is None and seen > lo_idx:
+            lo = value
+        if seen > hi_idx:
+            hi = value
+            break
+    return lo if n % 2 else (lo + hi) / 2
+
+
 @dataclass
 class RelationalAnalyzer:
     """Analyzes relationships between FHIR resources."""
@@ -920,8 +993,8 @@ class RelationalAnalyzer:
     # Reverse mapping for efficient per-patient encounter flushing
     patient_to_encounters: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
 
-    # Maps Encounter ID → Patient ID (built while processing Encounter resources)
-    encounter_to_patient: Dict[str, str] = field(default_factory=dict)
+    # Encounters per patient: one entry per flushed patient (len of patient_to_encounters at flush)
+    _encounters_per_patient: 'CardinalityStats' = field(default_factory=lambda: CardinalityStats())
 
     # Temporal tracking: incremental per-patient and per-type
     # _temporal_by_type:    {resource_type: [min_date, max_date, count]}
@@ -930,10 +1003,20 @@ class RelationalAnalyzer:
     _temporal_by_patient: Dict[str, list] = field(default_factory=lambda: defaultdict(lambda: [None, None]))
     _temporal_count: int = field(default=0)
 
-    # Maximum nesting depth per resource (array.array for compact int storage)
-    max_depths: Dict[str, Any] = field(default_factory=lambda: defaultdict(lambda: array.array('I')))
-    # Sizes of every array encountered, keyed by resource type
-    array_sizes: Dict[str, Any] = field(default_factory=lambda: defaultdict(lambda: array.array('I')))
+    # Maximum nesting depth per resource, as a histogram {resource_type: Counter({depth: n_resources})}.
+    # Depth is capped at 50, so this stays tiny regardless of resource count and still gives an exact median.
+    max_depths: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    # Array sizes as running aggregates {key: [count, min, max, total]} — constant memory per resource type
+    array_sizes: Dict[str, list] = field(default_factory=lambda: defaultdict(lambda: [0, None, None, 0]))
+
+    def add_array_size(self, key: str, size: int) -> None:
+        slot = self.array_sizes[key]
+        slot[0] += 1
+        if slot[1] is None or size < slot[1]:
+            slot[1] = size
+        if slot[2] is None or size > slot[2]:
+            slot[2] = size
+        slot[3] += size
 
     # Counts for patient/encounter linkage quality metrics
     resources_with_patient_ref: Dict[str, int] = field(default_factory=Counter)
@@ -1027,12 +1110,13 @@ class RelationalAnalyzer:
                 for count in encounter_counts.values():
                     stats.add(count)
 
-        # Encounters per Patient (from encounter→patient mapping; overrides Encounter per_patient)
-        encounters_per_patient = Counter(self.encounter_to_patient.values())
-        if encounters_per_patient:
-            enc_per_pat = CardinalityStats()
-            for count in encounters_per_patient.values():
-                enc_per_pat.add(count)
+        # Encounters per Patient (from per-patient flushes plus unflushed leftovers;
+        # overrides Encounter per_patient)
+        enc_per_pat = CardinalityStats(array.array('I', self._encounters_per_patient.counts))
+        for enc_ids in self.patient_to_encounters.values():
+            if enc_ids:
+                enc_per_pat.add(len(enc_ids))
+        if enc_per_pat.counts:
             results.setdefault('Encounter', {})['per_patient'] = enc_per_pat
 
         return results
@@ -1102,24 +1186,25 @@ class RelationalAnalyzer:
     def compute_structural_stats(self) -> Dict[str, Any]:
         """Compute structural depth statistics."""
         depth_stats = {}
-        for rt, depths in self.max_depths.items():
-            if depths:
+        for rt, hist in self.max_depths.items():
+            n = sum(hist.values())
+            if n:
                 depth_stats[rt] = {
-                    'min_depth': min(depths),
-                    'max_depth': max(depths),
-                    'mean_depth': round(statistics.mean(depths), 2),
-                    'median_depth': statistics.median(depths)
+                    'min_depth': min(hist),
+                    'max_depth': max(hist),
+                    'mean_depth': round(sum(d * c for d, c in hist.items()) / n, 2),
+                    'median_depth': _histogram_median(hist)
                 }
 
         array_stats = {}
-        for key, sizes in self.array_sizes.items():
-            if sizes:
+        for key, (count, min_size, max_size, total) in self.array_sizes.items():
+            if count:
                 array_stats[key] = {
-                    'count': len(sizes),
-                    'min_size': min(sizes),
-                    'max_size': max(sizes),
-                    'mean_size': round(statistics.mean(sizes), 2),
-                    'total_elements': sum(sizes)
+                    'count': count,
+                    'min_size': min_size,
+                    'max_size': max_size,
+                    'mean_size': round(total / count, 2),
+                    'total_elements': total
                 }
 
         return {
@@ -1205,6 +1290,12 @@ def check_server(session: requests.Session, base_url: str, verbose: bool = True)
 
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# Network-level failures worth retrying (slow pages on large patients, dropped connections)
+_RETRYABLE_EXCEPTIONS = (
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+)
 
 
 def _get_with_retry(
@@ -1213,19 +1304,31 @@ def _get_with_retry(
         max_retries: int = 3,
         timeout: int = 60
 ) -> requests.Response:
-    """GET with exponential backoff for transient server errors (429, 5xx)."""
+    """GET with exponential backoff for transient errors (429, 5xx, timeouts, dropped connections)."""
     for attempt in range(max_retries + 1):
-        response = session.get(url, timeout=timeout)
+        try:
+            response = session.get(url, timeout=timeout)
+        except _RETRYABLE_EXCEPTIONS as e:
+            if attempt == max_retries:
+                raise
+            wait = 2 ** attempt
+            print(f"  [retry {attempt + 1}/{max_retries}] {type(e).__name__} — "
+                  f"waiting {wait}s before retrying...")
+            time.sleep(wait)
+            continue
         if response.status_code not in _RETRYABLE_STATUS:
             response.raise_for_status()
             return response
         if attempt == max_retries:
             response.raise_for_status()
-        wait = float(response.headers.get('Retry-After', 2 ** attempt))
+        try:
+            wait = float(response.headers.get('Retry-After', 2 ** attempt))
+        except ValueError:  # Retry-After may also be an HTTP date
+            wait = 2 ** attempt
         print(f"  [retry {attempt + 1}/{max_retries}] HTTP {response.status_code} — "
               f"waiting {wait:.0f}s before retrying...")
         time.sleep(wait)
-    return response  # unreachable
+    raise RuntimeError("unreachable")
 
 
 def _follow_pages(
@@ -1236,7 +1339,7 @@ def _follow_pages(
     """Fetch a paginated FHIR Bundle sequence, yielding one Bundle per page."""
     while url:
         response = _get_with_retry(session, url, max_retries=max_retries)
-        bundle = response.json()
+        bundle = _json_loads(response.content)
         yield bundle
         url = next(
             (link['url'] for link in bundle.get('link', []) if link.get('relation') == 'next'),
@@ -1274,20 +1377,21 @@ def fetch_patient_resources(
         base_url: str,
         patient_id: str,
         page_size: int = 100,
-        errors: Optional[List[str]] = None,
         max_retries: int = 3
-) -> Generator[Dict, None, None]:
-    """Stream all resources for a patient via $everything, following pagination."""
+) -> List[Dict]:
+    """Fetch all resources for a patient via $everything, following pagination.
+
+    Raises on failure instead of returning a partial bundle: profiling only the first
+    pages of a patient would silently skew the per-patient statistics.
+    """
     url = f"{base_url}/Patient/{patient_id}/$everything?_count={page_size}"
-    try:
-        for bundle in _follow_pages(session, url, max_retries=max_retries):
-            for entry in bundle.get('entry', []):
-                resource = entry.get('resource')
-                if resource and isinstance(resource, dict):
-                    yield resource
-    except Exception as e:
-        if errors is not None:
-            errors.append(f"Error fetching Patient/{patient_id}: {e}")
+    resources: List[Dict] = []
+    for bundle in _follow_pages(session, url, max_retries=max_retries):
+        for entry in bundle.get('entry', []):
+            resource = entry.get('resource')
+            if resource and isinstance(resource, dict):
+                resources.append(resource)
+    return resources
 
 
 _thread_local = threading.local()
@@ -1303,7 +1407,7 @@ def _fetch_patient_bundle(
         page_size: int,
         max_retries: int,
         request_delay: float,
-) -> Tuple[str, List[Dict], List[str]]:
+) -> Tuple[str, List[Dict]]:
     """Fetch all resources for one patient. Worker function for the prefetch thread pool.
 
     Each worker thread reuses its own session (thread-local) to avoid the overhead of
@@ -1311,13 +1415,12 @@ def _fetch_patient_bundle(
     """
     if not hasattr(_thread_local, 'session'):
         _thread_local.session = make_session(auth_token, auth_user, auth_password, verify_ssl)
-    errors: List[str] = []
-    resources = list(fetch_patient_resources(
-        _thread_local.session, base_url, patient_id, page_size, errors, max_retries
-    ))
+    resources = fetch_patient_resources(
+        _thread_local.session, base_url, patient_id, page_size, max_retries
+    )
     if request_delay > 0:
         time.sleep(request_delay)
-    return patient_id, resources, errors
+    return patient_id, resources
 
 
 # =============================================================================
@@ -1386,12 +1489,12 @@ def traverse_resource(
 class Aggregator:
     """Main aggregation engine."""
 
-    def __init__(self, config: ProfilerConfig):
+    def __init__(self, config: ProfilerConfig, errors: Optional[ErrorLog] = None):
         self.config = config
         self.resource_types: Dict[str, ResourceTypeStatistics] = {}
         self.files_processed: int = 0
         self.total_resources: int = 0
-        self.errors: List[str] = []
+        self.errors: ErrorLog = errors if errors is not None else ErrorLog()
         self.relational = RelationalAnalyzer()
         # known_ids (inside relational) is reused for dedup — no separate seen_resource_ids needed
         self.dedup_counts: Counter = Counter()  # per-type count of skipped duplicates
@@ -1441,6 +1544,7 @@ class Aggregator:
         local_encounter_ref: Optional[str] = None
         resource_max_depth: int = 0
         rt_prefix_len = len(resource_type) + 1
+        fhir_type_sample_size = self.config.fhir_type_sample_size
 
         for path, value, python_type, is_first_in_resource, depth in traverse_resource(
                 resource,
@@ -1453,15 +1557,19 @@ class Aggregator:
                 field_stats.mark_resource_presence()
                 paths_seen_in_resource.add(path)
 
-            field_name = path.rstrip('[]').rsplit('.', 1)[-1]
-
             if python_type not in ('array', 'object'):
                 field_stats.add_value(value, python_type)
-                field_stats.fhir_types[detect_fhir_type(value, field_name)] += 1
+                # Type detection is regex-heavy; the first N values per field are enough
+                # to determine the dominant FHIR type (only the most common one is exported)
+                if field_stats.value_count <= fhir_type_sample_size:
+                    field_name = path.rstrip('[]').rsplit('.', 1)[-1]
+                    field_stats.fhir_types[detect_fhir_type(value, field_name)] += 1
             elif python_type == 'object':
                 field_stats.types_seen[python_type] += 1
                 field_stats.value_count += 1
-                field_stats.fhir_types[detect_fhir_type(value, field_name)] += 1
+                if field_stats.value_count <= fhir_type_sample_size:
+                    field_name = path.rstrip('[]').rsplit('.', 1)[-1]
+                    field_stats.fhir_types[detect_fhir_type(value, field_name)] += 1
             else:  # array
                 field_stats.types_seen[python_type] += 1
                 field_stats.value_count += 1
@@ -1473,7 +1581,7 @@ class Aggregator:
             resource_max_depth = max(resource_max_depth, depth)
 
             if python_type == 'array':
-                self.relational.array_sizes[f"{resource_type}_arrays"].append(len(value))
+                self.relational.add_array_size(f"{resource_type}_arrays", len(value))
 
             elif python_type == 'object' and 'reference' in value:
                 ref_value = value['reference']
@@ -1495,7 +1603,7 @@ class Aggregator:
         # ── post-traversal relational updates ─────────────────────────────────
         if analyze:
             self.relational.extract_temporal(resource)
-            self.relational.max_depths[resource_type].append(resource_max_depth)
+            self.relational.max_depths[resource_type][resource_max_depth] += 1
 
             if local_patient_ref:
                 self.relational.cardinality_by_patient[resource_type][local_patient_ref] += 1
@@ -1508,7 +1616,6 @@ class Aggregator:
                 self.relational.resources_with_encounter_ref[resource_type] += 1
 
             if resource_type == 'Encounter' and local_patient_ref and resource_id:
-                self.relational.encounter_to_patient[resource_id] = local_patient_ref
                 self.relational.patient_to_encounters[local_patient_ref].add(resource_id)
 
     def flush_patient_cardinality(self, patient_id: str) -> None:
@@ -1522,7 +1629,10 @@ class Aggregator:
             if not rel.cardinality_by_patient[rt]:
                 del rel.cardinality_by_patient[rt]
 
-        for enc_id in rel.patient_to_encounters.pop(patient_id, set()):
+        enc_ids = rel.patient_to_encounters.pop(patient_id, set())
+        if enc_ids:
+            rel._encounters_per_patient.add(len(enc_ids))
+        for enc_id in enc_ids:
             for rt in list(rel.cardinality_by_encounter.keys()):
                 count = rel.cardinality_by_encounter[rt].pop(enc_id, None)
                 if count is not None:
@@ -1976,9 +2086,10 @@ def write_run_summary(
         summary: dict,
         relational: RelationalAnalyzer,
         dedup_counts: Counter,
-        peak_mb: float,
-        all_errors: List[str],
+        peak_mb: Optional[float],
+        errors: ErrorLog,
         output_files: dict,
+        abort_reason: Optional[str] = None,
 ) -> Path:
     """Write a human-readable run summary to 00_run_summary.txt."""
     output_file = output_dir / "00_run_summary.txt"
@@ -1996,10 +2107,14 @@ def write_run_summary(
     lines.append("RUN SUMMARY — FHIRScan Server Profiler")
     lines.append("=" * 40)
     lines.append(f"Run name:  {run_name}")
+    if abort_reason:
+        lines.append(f"Status:    ABORTED — partial results only ({abort_reason})")
+    else:
+        lines.append("Status:    complete")
     lines.append(f"Started:   {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Finished:  {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Elapsed:   {_format_elapsed(elapsed)}")
-    lines.append(f"Peak RAM:  {peak_mb:.0f} MB")
+    lines.append(f"Peak RAM:  {_format_ram(peak_mb)}")
 
     _section("INPUT")
     lines.append(f"Server:             {config.server_base_url}")
@@ -2041,13 +2156,13 @@ def write_run_summary(
             lines.append(f"  {rt}: {count:,}")
 
     _section("ERRORS")
-    lines.append(f"Total: {len(all_errors)}")
-    if all_errors:
+    lines.append(f"Total: {errors.count}")
+    if errors.count:
         lines.append("")
-        for err in all_errors[:20]:
+        for err in errors.first[:20]:
             lines.append(f"  {err}")
-        if len(all_errors) > 20:
-            lines.append(f"  ... and {len(all_errors) - 20} more (see 99_errors.txt)")
+        if errors.count > 20:
+            lines.append(f"  ... and {errors.count - 20} more (see 99_errors.txt)")
 
     _section("OUTPUT FILES")
     for _, path in sorted(output_files.items()):
@@ -2063,6 +2178,14 @@ def write_run_summary(
 # =============================================================================
 # MAIN PROFILER
 # =============================================================================
+
+class _RunAborted(Exception):
+    """Raised to stop the run early; partial results are still exported."""
+
+
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
 
 def run_profiler(config: ProfilerConfig) -> dict:
     """Run the FHIR dataset profiler with relational analysis."""
@@ -2089,9 +2212,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
     if not check_server(session, config.server_base_url, verbose):
         return {'error': 'Server unreachable'}
 
-    fetch_errors: List[str] = []
     total_patients = fetch_patient_count(session, config.server_base_url)
-    effective_limit = config.patient_limit or total_patients  # None if both unknown
 
     if verbose:
         count_str = f"{total_patients:,}" if total_patients is not None else "unknown"
@@ -2104,32 +2225,89 @@ def run_profiler(config: ProfilerConfig) -> dict:
         print("No patients found on server!")
         return {'error': 'No patients found'}
 
-    aggregator = Aggregator(config)
-    if not tracemalloc.is_tracing():
-        tracemalloc.start()
+    # Errors are appended to 99_errors.txt immediately, so the file survives a crash or kill
+    error_log = ErrorLog(timestamped_output_dir / "99_errors.txt")
+    aggregator = Aggregator(config, errors=error_log)
 
+    # Load all patient IDs up front. Streaming them lazily kept one /Patient paging cursor
+    # open for the whole multi-hour run; if it (or the auth token) expired, the run crashed
+    # and lost everything. Now such problems fail here, before any work is done.
     if verbose:
+        print("\nLoading patient IDs...")
+    patient_ids: List[str] = []
+    try:
+        for pid in fetch_patient_ids(session, config.server_base_url,
+                                     max(config.page_size, 1000), config.max_retries):
+            patient_ids.append(pid)
+            if config.patient_limit and len(patient_ids) >= config.patient_limit:
+                break
+    except Exception as e:
+        error_log.append(f"Failed to load patient IDs: {type(e).__name__}: {e}")
+        error_log.close()
+        print(f"  Error: failed to load patient IDs — {e}")
+        return {'error': f'Failed to load patient IDs: {e}'}
+    n_patients = len(patient_ids)
+    if verbose:
+        print(f"  {n_patients:,} patient IDs loaded")
         print(f"\nFetching and processing patients...")
 
-    patient_id_iter = fetch_patient_ids(
-        session, config.server_base_url, config.page_size, config.max_retries
-    )
     idx = 0
+    consecutive_failures = 0
 
-    if config.workers > 1:
-        if verbose:
-            print(f"  (prefetch pipeline: {config.workers} fetch workers)")
-        max_in_flight = config.workers * 2
-        active: Dict[concurrent.futures.Future, str] = {}
-        submitted = 0
+    def _handle_patient(patient_id: str, resources: Optional[List[Dict]], fetch_error: Optional[Exception]) -> None:
+        """Process one fetched patient (or record its fetch failure) and report progress."""
+        nonlocal idx, consecutive_failures
+        idx += 1
+        if fetch_error is not None:
+            error_log.append(f"Error fetching Patient/{patient_id}: {type(fetch_error).__name__}: {fetch_error}")
+            consecutive_failures += 1
+            if consecutive_failures >= config.max_consecutive_failures:
+                # e.g. expired auth token or server down — stop instead of logging errors for hours
+                raise _RunAborted(f"{consecutive_failures} consecutive patients failed to fetch; "
+                                  f"last error: {type(fetch_error).__name__}: {fetch_error}")
+        else:
+            consecutive_failures = 0
+            try:
+                aggregator.process_resources(resources)
+                aggregator.flush_patient_cardinality(patient_id)
+                aggregator.mark_file_processed()
+            except Exception as e:
+                error_log.append(f"Fatal error processing Patient/{patient_id}: {e}")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=config.workers) as executor:
-            def _submit_next() -> bool:
-                nonlocal submitted
-                if config.patient_limit and submitted >= config.patient_limit:
-                    return False
-                try:
-                    pid = next(patient_id_iter)
+        if verbose and (idx % 500 == 0 or idx == n_patients):
+            elapsed_so_far = time.time() - start_time
+            pat_per_sec = idx / elapsed_so_far if elapsed_so_far > 0 else 0
+            eta_sec = (n_patients - idx) / pat_per_sec if pat_per_sec > 0 else 0
+            print(f"  [{idx}/{n_patients}] "
+                  f"Resources: {aggregator.total_resources:,} | "
+                  f"{pat_per_sec:.1f} pat/s | "
+                  f"ETA: {eta_sec / 60:.1f} min | "
+                  f"Peak RAM: {_format_ram(_get_peak_ram_mb())}")
+
+    # Turn SIGTERM (e.g. `kill`, docker stop, job scheduler) into KeyboardInterrupt so that
+    # partial results are still exported. SIGKILL / the OOM killer cannot be caught.
+    previous_sigterm = None
+    try:
+        previous_sigterm = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    except (ValueError, AttributeError, OSError):
+        pass  # not in the main thread or platform without SIGTERM
+
+    abort_reason: Optional[str] = None
+    try:
+        if config.workers > 1:
+            if verbose:
+                print(f"  (prefetch pipeline: {config.workers} fetch workers)")
+            max_in_flight = config.workers * 2
+            active: Dict[concurrent.futures.Future, str] = {}
+            # Managed manually (not `with`) so an abort does not wait for queued fetches
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.workers)
+            try:
+                id_iter = iter(patient_ids)
+
+                def _submit_next() -> bool:
+                    pid = next(id_iter, None)
+                    if pid is None:
+                        return False
                     f = executor.submit(
                         _fetch_patient_bundle,
                         config.auth_token, config.auth_user, config.auth_password,
@@ -2137,93 +2315,56 @@ def run_profiler(config: ProfilerConfig) -> dict:
                         config.page_size, config.max_retries, config.request_delay,
                     )
                     active[f] = pid
-                    submitted += 1
                     return True
-                except StopIteration:
-                    return False
 
-            for _ in range(max_in_flight):
-                if not _submit_next():
-                    break
-
-            limit_reached = False
-            while active and not limit_reached:
-                done, _ = concurrent.futures.wait(
-                    active, return_when=concurrent.futures.FIRST_COMPLETED
-                )
-                for future in done:
-                    patient_id = active.pop(future)
-                    try:
-                        _, resources, errors = future.result()
-                        fetch_errors.extend(errors)
-                        for resource in resources:
-                            aggregator.process_resource(resource)
-                        aggregator.flush_patient_cardinality(patient_id)
-                        aggregator.mark_file_processed()
-                    except Exception as e:
-                        fetch_errors.append(f"Fatal error processing Patient/{patient_id}: {e}")
-
-                    idx += 1
-                    if verbose and (idx % 500 == 0 or idx == effective_limit):
-                        elapsed_so_far = time.time() - start_time
-                        pat_per_sec = idx / elapsed_so_far if elapsed_so_far > 0 else 0
-                        eta_sec = (effective_limit - idx) / pat_per_sec if (pat_per_sec > 0 and effective_limit) else 0
-                        _, peak_bytes = tracemalloc.get_traced_memory()
-                        summary = aggregator.get_summary()
-                        print(f"  [{idx}/{effective_limit or '?'}] "
-                              f"Resources: {summary['total_resources']:,} | "
-                              f"{pat_per_sec:.1f} pat/s | "
-                              f"ETA: {eta_sec / 60:.1f} min | "
-                              f"Peak RAM: {peak_bytes / 1024 / 1024:.0f} MB")
-
-                    if config.patient_limit and idx >= config.patient_limit:
-                        if verbose:
-                            print(f"\n  Patient limit of {config.patient_limit:,} reached — stopping.")
-                        limit_reached = True
-                        for f in list(active):
-                            f.cancel()
-                        active.clear()
+                for _ in range(max_in_flight):
+                    if not _submit_next():
                         break
 
-                    if not limit_reached:
+                while active:
+                    done, _ = concurrent.futures.wait(
+                        active, return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+                    for future in done:
+                        patient_id = active.pop(future)
+                        try:
+                            _, resources = future.result()
+                        except Exception as e:
+                            _handle_patient(patient_id, None, e)
+                        else:
+                            _handle_patient(patient_id, resources, None)
+                            del resources
                         _submit_next()
-    else:
-        for patient_id in patient_id_iter:
-            idx += 1
-            try:
-                for resource in fetch_patient_resources(
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            for patient_id in patient_ids:
+                try:
+                    resources = fetch_patient_resources(
                         session, config.server_base_url, patient_id,
-                        config.page_size, fetch_errors, config.max_retries):
-                    aggregator.process_resource(resource)
-                aggregator.flush_patient_cardinality(patient_id)
-                aggregator.mark_file_processed()
-
-                if verbose and (idx % 500 == 0 or idx == effective_limit):
-                    elapsed_so_far = time.time() - start_time
-                    pat_per_sec = idx / elapsed_so_far if elapsed_so_far > 0 else 0
-                    eta_sec = (effective_limit - idx) / pat_per_sec if (pat_per_sec > 0 and effective_limit) else 0
-                    _, peak_bytes = tracemalloc.get_traced_memory()
-                    summary = aggregator.get_summary()
-                    print(f"  [{idx}/{effective_limit or '?'}] "
-                          f"Resources: {summary['total_resources']:,} | "
-                          f"{pat_per_sec:.1f} pat/s | "
-                          f"ETA: {eta_sec / 60:.1f} min | "
-                          f"Peak RAM: {peak_bytes / 1024 / 1024:.0f} MB")
-
-                if config.patient_limit and idx >= config.patient_limit:
-                    if verbose:
-                        print(f"\n  Patient limit of {config.patient_limit:,} reached — stopping.")
-                    break
-
+                        config.page_size, config.max_retries)
+                except Exception as e:
+                    _handle_patient(patient_id, None, e)
+                else:
+                    _handle_patient(patient_id, resources, None)
+                    del resources
                 if config.request_delay > 0:
                     time.sleep(config.request_delay)
+    except KeyboardInterrupt:
+        abort_reason = "interrupted (Ctrl+C or SIGTERM)"
+    except _RunAborted as e:
+        abort_reason = str(e)
+    except Exception as e:
+        abort_reason = f"{type(e).__name__}: {e}"
+        error_log.append(f"Run aborted: {abort_reason}\n{traceback.format_exc()}")
+    finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
-            except Exception as e:
-                fetch_errors.append(f"Fatal error processing Patient/{patient_id}: {e}")
+    if abort_reason:
+        error_log.append(f"Run aborted after {idx:,} of {n_patients:,} patients: {abort_reason}")
 
-    _, peak_bytes = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    peak_mb = peak_bytes / 1024 / 1024
+    peak_mb = _get_peak_ram_mb()
 
     # Get results
     results = aggregator.get_results()
@@ -2233,31 +2374,35 @@ def run_profiler(config: ProfilerConfig) -> dict:
 
     if verbose:
         print(f"\n" + "-" * 50)
-        print("Processing Complete!")
+        if abort_reason:
+            print(f"Processing ABORTED — {abort_reason}")
+            print("  Exporting partial results...")
+        else:
+            print("Processing Complete!")
         print(f"  Patients processed: {summary['files_processed']:,}")
         print(f"  Total resources:    {summary['total_resources']:,}")
         print(f"  Resource types:     {len(summary['resource_types'])}")
         print(f"  Unique patients:    {len(relational.known_ids.get('Patient', set())):,}")
         print(f"  Unique encounters:  {len(relational.known_ids.get('Encounter', set())):,}")
-        print(f"  Peak RAM:           {peak_mb:.0f} MB")
+        print(f"  Peak RAM:           {_format_ram(peak_mb)}")
         print("-" * 50)
 
     # Export all results
     if verbose:
         print(f"\nExporting results to: {timestamped_output_dir}")
 
-    output_files = export_all_results(results, relational, dedup_counts, timestamped_output_dir, verbose)
+    try:
+        output_files = export_all_results(results, relational, dedup_counts, timestamped_output_dir, verbose)
+    except Exception as e:
+        output_files = {}
+        error_log.append(f"Export failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        print(f"  Error: export failed — {e}")
 
-    # Write errors
-    all_errors = aggregator.errors + fetch_errors
-    if all_errors:
-        error_file = timestamped_output_dir / "99_errors.txt"
-        with open(error_file, 'w', encoding='utf-8') as f:
-            for error in all_errors:
-                f.write(f"{error}\n")
-        output_files['_errors'] = error_file
+    error_log.close()
+    if error_log.count:
+        output_files['_errors'] = error_log.path
         if verbose:
-            print(f"\n  {len(all_errors)} error(s) written to: {error_file.name}")
+            print(f"\n  {error_log.count} error(s) written to: {error_log.path.name}")
 
     elapsed = time.time() - start_time
 
@@ -2272,28 +2417,32 @@ def run_profiler(config: ProfilerConfig) -> dict:
         relational=relational,
         dedup_counts=dedup_counts,
         peak_mb=peak_mb,
-        all_errors=all_errors,
+        errors=error_log,
         output_files=output_files,
+        abort_reason=abort_reason,
     )
     output_files['_run_summary'] = summary_file
 
     if verbose:
-        print(f"\nDone! Elapsed: {elapsed:.2f}s | Peak RAM: {peak_mb:.0f} MB")
+        print(f"\nDone! Elapsed: {elapsed:.2f}s | Peak RAM: {_format_ram(peak_mb)}")
         print(f"\nOutput files:")
         for name, path in sorted(output_files.items()):
             print(f"  {path.name}")
 
-    return {
+    outcome = {
         'patients_processed': summary['files_processed'],
         'total_resources': summary['total_resources'],
         'resource_types': summary['resource_types'],
         'unique_patients': len(relational.known_ids.get('Patient', set())),
         'unique_encounters': len(relational.known_ids.get('Encounter', set())),
-        'peak_ram_mb': round(peak_mb, 1),
+        'peak_ram_mb': round(peak_mb, 1) if peak_mb is not None else None,
         'output_files': output_files,
         'elapsed_seconds': elapsed,
-        'error_count': len(all_errors)
+        'error_count': error_log.count
     }
+    if abort_reason:
+        outcome['error'] = f"Run aborted: {abort_reason}"
+    return outcome
 
 
 # =============================================================================
@@ -2320,7 +2469,7 @@ Examples:
     parser.add_argument('--no-verify-ssl', action='store_true', help='Disable SSL certificate verification (e.g. for self-signed certs)')
     parser.add_argument('--limit', type=int, default=None, help='Stop after N patients (for test runs)')
     parser.add_argument('--request-delay', type=float, default=0.0, help='Seconds to wait between patients (default: 0)')
-    parser.add_argument('--max-retries', type=int, default=3, help='Retries for transient server errors (default: 3)')
+    parser.add_argument('--max-retries', type=int, default=3, help='Retries for transient server errors and timeouts (default: 3)')
     parser.add_argument('--page-size', type=int, default=100, help='Resources per page (default: 100)')
     parser.add_argument('--top-n', type=int, default=20, help='Top values to track (default: 20)')
     parser.add_argument('--hll-precision', type=int, default=14, help='HyperLogLog precision (default: 14)')
@@ -2379,7 +2528,10 @@ Examples:
     sys.exit(0 if outcome.get('error') is None else 1)
 
 
-if __name__ == '__main__':
+if __name__ == '__main__' and len(sys.argv) > 1:
+    main()  # command line: python profiler_server.py <server_url> <output_dir> [options]
+
+elif __name__ == '__main__':
     # -------------------------------------------------------------------------
     # Configure your run here when starting from the IDE (e.g. PyCharm, VS Code)
     # -------------------------------------------------------------------------

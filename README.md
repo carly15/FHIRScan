@@ -67,8 +67,9 @@ If any of the above matters for your analysis, export the data first and use `pr
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.9+ (`profiler_server.py`: Python 3.11+)
 - `requests` — required for `profiler_server.py` only (`pip install requests`)
+- `orjson` — optional, speeds up JSON decoding in `profiler_server.py` (`pip install orjson`)
 
 ---
 
@@ -138,7 +139,7 @@ python profiler_server.py http://localhost:8080/fhir ./output --skip-types Binar
 | `--limit N` | Stop after N patients (for test runs) | all |
 | `--request-delay SEC` | Pause between patients per worker thread to avoid overloading the server | 0 |
 | `--workers N` | Parallel fetch threads; N threads fetch patient bundles concurrently while the main thread processes them | 1 |
-| `--max-retries N` | Retry attempts for transient server errors (429, 5xx) | 3 |
+| `--max-retries N` | Retry attempts for transient server errors (429, 5xx, timeouts, dropped connections) | 3 |
 | `--page-size N` | Resources per page for pagination | 100 |
 | `--top-n N` | Most frequent values to track per field | 20 |
 | `--skip-types TYPES` | Comma-separated resource types to exclude (e.g. `Binary`) | none |
@@ -151,6 +152,8 @@ python profiler_server.py http://localhost:8080/fhir ./output --skip-types Binar
 To run from an IDE instead of the terminal, edit the `if __name__ == '__main__':` block at the bottom of `profiler_server.py` — all the same options are available there as named variables.
 
 The server profiler verifies the connection via `/metadata` before processing and prints server name and FHIR version. Progress is reported every 500 patients with throughput, ETA, and peak RAM usage.
+
+All patient IDs are loaded before processing starts. A patient whose `$everything` bundle cannot be fetched completely is skipped (never profiled partially) and logged. If a run is aborted — Ctrl+C, SIGTERM, an unexpected error, or 50 consecutive failed patients (e.g. an expired token) — the partial results are still exported and `00_run_summary.txt` is marked `ABORTED`. Errors are written to `99_errors.txt` as they occur, so the file survives even a hard kill (e.g. by the OOM killer).
 
 ---
 
@@ -169,7 +172,7 @@ Each run writes to its own subfolder under `<output_dir>/` (named by timestamp o
 | `06_temporal_analysis.txt` | Date ranges per resource type and patient record span statistics |
 | `07_structural_analysis.txt` | Nesting depth and array size statistics per resource type |
 | `<ResourceType>_fields.csv` | Field-level statistics per resource type |
-| `99_errors.txt` | Parse or fetch errors (only written if errors occurred) |
+| `99_errors.txt` | Parse or fetch errors, written as they occur (only created if errors occurred) |
 
 For a detailed explanation of every column in each output file, see [METRICS.md](METRICS.md).
 
