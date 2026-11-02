@@ -1,17 +1,52 @@
 #!/usr/bin/env bash
-# Exportiert ein Comparison-Notebook als HTML-Report.
-# Nutzt Quarto wenn verfügbar, sonst nbconvert als Fallback.
+# Exportiert den DIZ-Bericht (oder eines der alten Comparison-Notebooks) als HTML.
 #
 # Verwendung:
-#   ./export_report.sh                   — diz_comparison.ipynb, aktueller Stand
-#   ./export_report.sh --run             — diz_comparison.ipynb, neu ausführen
-#   ./export_report.sh overview          — diz_comparison_overview.ipynb
-#   ./export_report.sh overview --run    — diz_comparison_overview.ipynb, neu ausführen
+#   ./export_report.sh --run             — diz_report.ipynb ausführen: HTML + Excel in results/<YYYYMMDD_HHMM>/
+#   ./export_report.sh                   — diz_report.ipynb, gespeicherter Stand (nur HTML, kein Excel)
+#   ./export_report.sh alt [--run]       — altes diz_comparison.ipynb
+#   ./export_report.sh overview [--run]  — altes diz_comparison_overview.ipynb
+#   ./export_report.sh all [--run]       — beide alten Reports, gemeinsam in results/<YYYYMMDD_HHMM>/
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPORT_DIR="$SCRIPT_DIR/../results"
+cd "$SCRIPT_DIR"   # Quarto löst Ressourcenpfade relativ zum Arbeitsverzeichnis auf
+export FHIRSCAN_SKIP_CSV=1   # Notebooks schreiben beim Export keine CSV-Ordner nach results/
+
+# ── DIZ-Bericht (Standard) ────────────────────────────────────────────────
+if [[ "${1:-}" != "alt" && "${1:-}" != "overview" && "${1:-}" != "all" ]]; then
+    STAMP="$(date +%Y%m%d_%H%M)"
+    OUT="$REPORT_DIR/$STAMP"
+    mkdir -p "$OUT"
+    export FHIRSCAN_OUT_DIR="$OUT" FHIRSCAN_STAMP="$STAMP"   # Zielordner für die Excel-Tabellen
+    if [[ "${1:-}" == "--run" ]]; then
+        EXEC=(--execute --no-execute-daemon)
+    else
+        EXEC=(--no-execute)
+    fi
+    quarto render diz_report.ipynb --to html "${EXEC[@]}" \
+        --output "FHIRScan_DIZ_Bericht_${STAMP}.html" --output-dir "$OUT"
+    echo "Bericht gespeichert in: $OUT"
+    exit 0
+fi
+
+# Beide Reports erzeugen und in einen Ordner mit dem späteren Zeitstempel verschieben
+if [[ "${1:-}" == "all" ]]; then
+    shift
+    "$SCRIPT_DIR/export_report.sh" alt "$@"
+    "$SCRIPT_DIR/export_report.sh" overview "$@"
+    VERGLEICH="$(ls -t "$REPORT_DIR"/FHIRScan_DIZ_Vergleich_*.html | head -1)"
+    UEBERSICHT="$(ls -t "$REPORT_DIR"/FHIRScan_DIZ_Uebersicht_*.html | head -1)"
+    STAMP="$(basename "$VERGLEICH" .html | grep -o '[0-9]\{8\}_[0-9]\{4\}$')"
+    STAMP2="$(basename "$UEBERSICHT" .html | grep -o '[0-9]\{8\}_[0-9]\{4\}$')"
+    [[ "$STAMP2" > "$STAMP" ]] && STAMP="$STAMP2"
+    mkdir -p "$REPORT_DIR/$STAMP"
+    mv "$VERGLEICH" "$UEBERSICHT" "$REPORT_DIR/$STAMP/"
+    echo "Beide Reports gespeichert in: $REPORT_DIR/$STAMP"
+    exit 0
+fi
 
 # Notebook auswählen
 if [[ "${1:-}" == "overview" ]]; then
@@ -21,6 +56,7 @@ if [[ "${1:-}" == "overview" ]]; then
 else
     NOTEBOOK="$SCRIPT_DIR/diz_comparison.ipynb"
     OUTFILE="FHIRScan_DIZ_Vergleich_$(date +%Y%m%d_%H%M)"
+    shift   # „alt“
 fi
 
 EXECUTE="${1:-}"
@@ -33,7 +69,7 @@ if command -v quarto &>/dev/null; then
         echo "Führe Notebook aus und exportiere..."
         quarto render "$NOTEBOOK" \
             --to html \
-            --execute \
+            --execute --no-execute-daemon \
             --output "${OUTFILE}.html" \
             --output-dir "$REPORT_DIR"
     else

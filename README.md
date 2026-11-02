@@ -1,5 +1,12 @@
 # FHIRScan — FHIR Dataset Profiler
 
+> [!NOTE]
+> **FHIRScan in brief**
+>
+> Hospitals store health data such as diagnoses, lab results and medications in a standard digital format called FHIR. FHIRScan scans such a dataset and reports what it contains: which kinds of data are present, how often each piece of information is filled in, and which values occur most frequently. It produces summary statistics instead of copying patient records. Comparing these reports across several data integration centres shows where their data differs and how well it fits together for joint research.
+
+---
+
 A Python tool for analysing large-scale FHIR R4 datasets to understand structure, completeness, and value distributions — without requiring full data flattening.
 
 Two ingestion modes are supported:
@@ -223,7 +230,11 @@ FHIRScan/
 │   ├── profiler_file.py           # File-based profiler (JSON / NDJSON)
 │   └── profiler_server.py         # Server-based profiler (FHIR REST API)
 └── heterogeneity_analysis/
-    └── diz_comparison.ipynb       # Cross-site heterogeneity analysis
+    ├── diz_report.ipynb           # Cross-site comparison report (HTML + Excel)
+    ├── export_report.sh           # ./export_report.sh --run → results/<YYYYMMDD_HHMM>/
+    ├── assets/                    # Logo and stylesheet for the report
+    ├── diz_comparison.ipynb       # Older comparison notebook
+    └── diz_comparison_overview.ipynb
 ```
 
 ---
