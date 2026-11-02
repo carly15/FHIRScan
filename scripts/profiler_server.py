@@ -116,6 +116,11 @@ except ImportError:
 
 _BERLIN_TZ = ZoneInfo('Europe/Berlin')
 
+# Output format 1 = runs before Nov 2026 (no version line, no year counts).
+# Format changes are additive only, so the DIZ report reads every format.
+FHIRSCAN_VERSION = "2026.11"
+OUTPUT_FORMAT = 2
+
 
 # =============================================================================
 # CONFIGURATION
@@ -974,6 +979,9 @@ class RelationalAnalyzer:
 
     # All resource IDs seen; used for deduplication and reference integrity checks
     known_ids: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
+    # Types whose IDs land in known_ids (dedup_types | integrity_types). References to any other
+    # type cannot be checked and are reported as 'unchecked', not as orphans.
+    tracked_types: Set[str] = field(default_factory=set)
 
     # Reference integrity: pre-aggregated during traversal
     # key = "SourceType.ref_path -> target_type"
@@ -1002,6 +1010,8 @@ class RelationalAnalyzer:
     _temporal_by_type: Dict[str, list] = field(default_factory=lambda: defaultdict(lambda: [None, None, 0]))
     _temporal_by_patient: Dict[str, list] = field(default_factory=lambda: defaultdict(lambda: [None, None]))
     _temporal_count: int = field(default=0)
+    # Resources per calendar year {resource_type: Counter({year: n})} — appended to 06 as year_counts_by_type
+    _temporal_years: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
 
     # Maximum nesting depth per resource, as a histogram {resource_type: Counter({depth: n_resources})}.
     # Depth is capped at 50, so this stays tiny regardless of resource count and still gives an exact median.
@@ -1032,7 +1042,8 @@ class RelationalAnalyzer:
         self._ref_totals[key] += 1
         if target_type is None:
             self._ref_unknown_type[key] += 1
-        else:
+        elif target_type in self.tracked_types:
+            # Untracked targets are reported as 'unchecked' — storing their IDs would only cost RAM
             self._ref_targets[key][target_id] += 1
             examples = self._ref_examples[key]
             if len(examples) < 3:
@@ -1073,6 +1084,7 @@ class RelationalAnalyzer:
         if type_slot[1] is None or effective > type_slot[1]:
             type_slot[1] = effective
         type_slot[2] += 1
+        self._temporal_years[resource_type][effective.year] += 1
 
         if patient_id:
             pat_slot = self._temporal_by_patient[patient_id]
@@ -1132,7 +1144,10 @@ class RelationalAnalyzer:
             orphan = 0
             target_type = key.rsplit(' -> ', 1)[-1] if ' -> ' in key else 'unknown'
 
-            if target_type != 'unknown':
+            unchecked = 0
+            if target_type != 'unknown' and target_type not in self.tracked_types:
+                unchecked = total - unknown
+            elif target_type != 'unknown':
                 known = self.known_ids.get(target_type, set())
                 for tid, count in self._ref_targets.get(key, {}).items():
                     if tid and tid in known:
@@ -1146,7 +1161,8 @@ class RelationalAnalyzer:
                     if len(orphan_refs) < 100:
                         orphan_refs.append({'source': src, 'path': path_part, 'target': raw})
 
-            refs_by_type[key] = {'total': total, 'valid': valid, 'orphan': orphan, 'unknown_type': unknown}
+            refs_by_type[key] = {'total': total, 'valid': valid, 'orphan': orphan, 'unknown_type': unknown,
+                                 'unchecked': unchecked}  # 'unchecked' added in output format 2
 
         return {
             'total_references': self._total_ref_count,
@@ -1180,7 +1196,11 @@ class RelationalAnalyzer:
                 'mean': round(statistics.mean(patient_spans), 1) if patient_spans else 0,
                 'median': statistics.median(patient_spans) if patient_spans else 0
             },
-            'date_ranges_by_type': type_ranges
+            'date_ranges_by_type': type_ranges,
+            # Added in output format 2 — older runs lack this key
+            'year_counts_by_type': {
+                rt: dict(sorted(years.items())) for rt, years in sorted(self._temporal_years.items())
+            }
         }
 
     def compute_structural_stats(self) -> Dict[str, Any]:
@@ -1495,7 +1515,7 @@ class Aggregator:
         self.files_processed: int = 0
         self.total_resources: int = 0
         self.errors: ErrorLog = errors if errors is not None else ErrorLog()
-        self.relational = RelationalAnalyzer()
+        self.relational = RelationalAnalyzer(tracked_types=config.dedup_types | config.integrity_types)
         # known_ids (inside relational) is reused for dedup — no separate seen_resource_ids needed
         self.dedup_counts: Counter = Counter()  # per-type count of skipped duplicates
 
@@ -2107,6 +2127,7 @@ def write_run_summary(
     lines.append("RUN SUMMARY — FHIRScan Server Profiler")
     lines.append("=" * 40)
     lines.append(f"Run name:  {run_name}")
+    lines.append(f"Version:   {FHIRSCAN_VERSION} (output format {OUTPUT_FORMAT})")
     if abort_reason:
         lines.append(f"Status:    ABORTED — partial results only ({abort_reason})")
     else:
@@ -2131,6 +2152,7 @@ def write_run_summary(
     lines.append(f"Relational analysis: {'enabled' if config.analyze_relations else 'disabled'}")
     lines.append(f"Skip types:          {', '.join(sorted(config.skip_types)) or '(none)'}")
     lines.append(f"Dedup types:         {', '.join(sorted(config.dedup_types)) or '(none)'}")
+    lines.append(f"Integrity types:     {', '.join(sorted(config.integrity_types)) or '(none)'}")
     lines.append(f"Inline extensions:   {'enabled' if config.inline_extensions else 'disabled'}")
     lines.append(f"HLL precision:       {config.hll_precision}")
 

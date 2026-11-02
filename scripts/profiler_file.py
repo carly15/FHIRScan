@@ -89,6 +89,11 @@ except ImportError:
 
 _BERLIN_TZ = ZoneInfo('Europe/Berlin')
 
+# Output format 1 = runs before Nov 2026 (no version line, no year counts).
+# Format changes are additive only, so the DIZ report reads every format.
+FHIRSCAN_VERSION = "2026.11"
+OUTPUT_FORMAT = 2
+
 
 # =============================================================================
 # CONFIGURATION
@@ -905,6 +910,8 @@ class RelationalAnalyzer:
     _temporal_by_type: Dict[str, list] = field(default_factory=lambda: defaultdict(lambda: [None, None, 0]))
     _temporal_by_patient: Dict[str, list] = field(default_factory=lambda: defaultdict(lambda: [None, None]))
     _temporal_count: int = field(default=0)
+    # Resources per calendar year {resource_type: Counter({year: n})} — appended to 06 as year_counts_by_type
+    _temporal_years: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
 
     # Maximum nesting depth per resource (array.array for compact int storage)
     max_depths: Dict[str, Any] = field(default_factory=lambda: defaultdict(lambda: array.array('I')))
@@ -966,6 +973,7 @@ class RelationalAnalyzer:
         if type_slot[1] is None or effective > type_slot[1]:
             type_slot[1] = effective
         type_slot[2] += 1
+        self._temporal_years[resource_type][effective.year] += 1
 
         if patient_id:
             pat_slot = self._temporal_by_patient[patient_id]
@@ -1060,7 +1068,11 @@ class RelationalAnalyzer:
                 'mean': round(statistics.mean(patient_spans), 1) if patient_spans else 0,
                 'median': statistics.median(patient_spans) if patient_spans else 0
             },
-            'date_ranges_by_type': type_ranges
+            'date_ranges_by_type': type_ranges,
+            # Added in output format 2 — older runs lack this key
+            'year_counts_by_type': {
+                rt: dict(sorted(years.items())) for rt, years in sorted(self._temporal_years.items())
+            }
         }
 
     def compute_structural_stats(self) -> Dict[str, Any]:
@@ -1856,6 +1868,7 @@ def write_run_summary(
     lines.append("RUN SUMMARY — FHIRScan File Profiler")
     lines.append("=" * 40)
     lines.append(f"Run name:  {run_name}")
+    lines.append(f"Version:   {FHIRSCAN_VERSION} (output format {OUTPUT_FORMAT})")
     lines.append(f"Started:   {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Finished:  {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Elapsed:   {_format_elapsed(elapsed)}")
