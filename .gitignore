@@ -30,3 +30,8 @@ diz_profiles/
 
 # Claude Code local config
 .claude/
+
+# Local only: BHC branding for the report and the older comparison notebooks
+heterogeneity_analysis/assets/
+heterogeneity_analysis/diz_comparison.ipynb
+heterogeneity_analysis/diz_comparison_overview.ipynb

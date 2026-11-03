@@ -231,10 +231,7 @@ FHIRScan/
 │   └── profiler_server.py         # Server-based profiler (FHIR REST API)
 └── heterogeneity_analysis/
     ├── diz_report.ipynb           # Cross-site comparison report (HTML + Excel)
-    ├── export_report.sh           # ./export_report.sh --run → results/<YYYYMMDD_HHMM>/
-    ├── assets/                    # Logo and stylesheet for the report
-    ├── diz_comparison.ipynb       # Older comparison notebook
-    └── diz_comparison_overview.ipynb
+    └── export_report.sh           # ./export_report.sh --run → results/<YYYYMMDD_HHMM>/
 ```
 
 ---
