@@ -4,6 +4,8 @@
 # Verwendung:
 #   ./export_report.sh --run             — diz_report.ipynb ausführen: HTML + Excel in results/<YYYYMMDD_HHMM>/
 #   ./export_report.sh                   — diz_report.ipynb, gespeicherter Stand (nur HTML, kein Excel)
+#   ./export_report.sh v2 [--run]        — diz_report_v2.ipynb: zusätzlich je Kategorie (Läufe mit FHIRScan v2)
+#   ./export_report.sh katalog [--run]   — data_catalog.ipynb: Datenkatalog (nur lokal)
 #   ./export_report.sh alt [--run]       — altes diz_comparison.ipynb
 #   ./export_report.sh overview [--run]  — altes diz_comparison_overview.ipynb
 #   ./export_report.sh all [--run]       — beide alten Reports, gemeinsam in results/<YYYYMMDD_HHMM>/
@@ -15,8 +17,20 @@ REPORT_DIR="$SCRIPT_DIR/../results"
 cd "$SCRIPT_DIR"   # Quarto löst Ressourcenpfade relativ zum Arbeitsverzeichnis auf
 export FHIRSCAN_SKIP_CSV=1   # Notebooks schreiben beim Export keine CSV-Ordner nach results/
 
-# ── DIZ-Bericht (Standard) ────────────────────────────────────────────────
+# ── DIZ-Bericht (Standard) bzw. v2 mit Aufschlüsselung nach Kategorie ─────
 if [[ "${1:-}" != "alt" && "${1:-}" != "overview" && "${1:-}" != "all" ]]; then
+    BERICHT="diz_report.ipynb"
+    NAME="FHIRScan_DIZ_Bericht"
+    if [[ "${1:-}" == "v2" ]]; then
+        BERICHT="diz_report_v2.ipynb"
+        NAME="FHIRScan_DIZ_Bericht_v2"
+        shift
+    fi
+    if [[ "${1:-}" == "katalog" ]]; then
+        BERICHT="data_catalog.ipynb"
+        NAME="FHIRScan_Datenkatalog"
+        shift
+    fi
     STAMP="$(date +%Y%m%d_%H%M)"
     OUT="$REPORT_DIR/$STAMP"
     mkdir -p "$OUT"
@@ -26,8 +40,8 @@ if [[ "${1:-}" != "alt" && "${1:-}" != "overview" && "${1:-}" != "all" ]]; then
     else
         EXEC=(--no-execute)
     fi
-    quarto render diz_report.ipynb --to html "${EXEC[@]}" \
-        --output "FHIRScan_DIZ_Bericht_${STAMP}.html" --output-dir "$OUT"
+    quarto render "$BERICHT" --to html "${EXEC[@]}" \
+        --output "${NAME}_${STAMP}.html" --output-dir "$OUT"
     echo "Bericht gespeichert in: $OUT"
     exit 0
 fi

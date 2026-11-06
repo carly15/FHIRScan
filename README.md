@@ -235,7 +235,8 @@ FHIRScan/
 │       └── groups.py              # Which field defines the groups, per resource type
 └── heterogeneity_analysis/
     ├── diz_report.ipynb           # Cross-site comparison report (HTML + Excel)
-    └── export_report.sh           # ./export_report.sh --run → results/<YYYYMMDD_HHMM>/
+    ├── diz_report_v2.ipynb        # Same report plus a chapter per category (needs v2 runs)
+    └── export_report.sh           # ./export_report.sh [v2] --run → results/<YYYYMMDD_HHMM>/
 ```
 
 ---
