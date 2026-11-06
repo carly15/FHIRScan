@@ -36,6 +36,9 @@ Optionen
 --------
     --top-n N             Anzahl der häufigsten Werte je Feld (Standard: 20)
     --skip-types TYPEN    Kommagetrennte Ressourcentypen ausschließen (z. B. Binary)
+    --dedup-types TYPEN   Ressourcentypen, die bei mehrfachem Vorkommen nur einmal zählen
+                          (Standard: Medication,Location,Organization,Practitioner,
+                          PractitionerRole,Device,Substance)
     --run-name NAME       Eigener Name für den Ausgabeordner (Standard: Zeitstempel)
     --no-relations        Relationale Analyse deaktivieren
     --quiet               Keine Fortschrittsausgabe
@@ -81,7 +84,7 @@ from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 from datetime import datetime, timedelta
 import array
 import statistics
-import tracemalloc
+import os
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -89,10 +92,10 @@ except ImportError:
 
 _BERLIN_TZ = ZoneInfo('Europe/Berlin')
 
-# Output format 1 = runs before Nov 2026 (no version line, no year counts).
-# Format changes are additive only, so the DIZ report reads every format.
+# Format 1: runs before Nov 2026. Format 2: + version line, year counts.
+# Format 3: value_count no longer counts lists themselves (only items). The DIZ report reads every format.
 FHIRSCAN_VERSION = "2026.11"
-OUTPUT_FORMAT = 2
+OUTPUT_FORMAT = 3
 
 
 # =============================================================================
@@ -110,10 +113,14 @@ class ProfilerConfig:
     hll_precision: int = 14
     hll_threshold: int = 10000
     inline_extensions: bool = True
-    file_patterns: tuple = ("*.json", "*.ndjson")
+    file_suffixes: tuple = (".json", ".ndjson", ".jsonl")   # matched case-insensitively, in all subfolders
     verbose: bool = True
     run_name: Optional[str] = None          # custom output subfolder name; defaults to timestamp
     skip_types: Set[str] = field(default_factory=set)  # resource types to exclude from profiling
+    # Shared resources that legitimately appear in several files and are counted once. All other types
+    # are counted as found: local IDs are often reused between bundles (e.g. Patient/1 in every file).
+    dedup_types: Set[str] = field(default_factory=lambda: {
+        'Medication', 'Location', 'Organization', 'Practitioner', 'PractitionerRole', 'Device', 'Substance'})
 
     # Relational analysis settings
     analyze_relations: bool = True
@@ -122,33 +129,34 @@ class ProfilerConfig:
     def __post_init__(self):
         self.input_dir = Path(self.input_dir)
         self.output_dir = Path(self.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
 
 
 # =============================================================================
 # UTILITIES
 # =============================================================================
 
-def safe_json_load(file_path: Path) -> Generator[dict, None, None]:
-    """Load JSON or NDJSON file, yielding parsed objects."""
-    with open(file_path, 'r', encoding='utf-8') as f:
-        if file_path.suffix.lower() == '.ndjson':
+def safe_json_load(file_path: Path, errors: List[str]) -> Generator[dict, None, None]:
+    """Load JSON or NDJSON file, yielding parsed objects. Invalid content is appended to `errors`."""
+    # utf-8-sig: files saved by Windows tools often start with a byte order mark
+    with open(file_path, 'r', encoding='utf-8-sig') as f:
+        if file_path.suffix.lower() in ('.ndjson', '.jsonl'):
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if line:
                     try:
                         yield json.loads(line)
                     except json.JSONDecodeError as e:
-                        print(f"Warning: Invalid JSON at {file_path}:{line_num}: {e}")
+                        errors.append(f"Invalid JSON at {file_path}:{line_num}: {e}")
         else:
             try:
                 data = json.load(f)
-                if isinstance(data, list):
-                    yield from data
-                else:
-                    yield data
             except json.JSONDecodeError as e:
-                print(f"Warning: Invalid JSON in {file_path}: {e}")
+                errors.append(f"Invalid JSON in {file_path}: {e}")
+                return
+            if isinstance(data, list):
+                yield from data
+            else:
+                yield data
 
 
 def get_python_type(value: Any) -> str:
@@ -181,6 +189,25 @@ def _check_output_writable(output_dir: Path) -> bool:
     except (PermissionError, OSError) as e:
         print(f"Error: output directory is not writable: {output_dir}\n  {e}")
         return False
+
+
+def _get_peak_ram_mb() -> Optional[float]:
+    """Peak resident memory (RSS) of this process in MB, read from the OS (no overhead).
+
+    Replaces tracemalloc, which hooks every allocation and slowed parsing down ~6x.
+    Returns None on Windows, where the resource module is unavailable.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # ru_maxrss is bytes on macOS, kilobytes on Linux
+    return peak / 1024 / 1024 if sys.platform == 'darwin' else peak / 1024
+
+
+def _format_ram(mb: Optional[float]) -> str:
+    return f"{mb:.0f} MB" if mb is not None else "n/a"
 
 
 # =============================================================================
@@ -904,6 +931,17 @@ class RelationalAnalyzer:
     # Maps Encounter ID → Patient ID (built while processing Encounter resources)
     encounter_to_patient: Dict[str, str] = field(default_factory=dict)
 
+    # fullUrl → (resourceType, id) of the bundle being processed, to resolve "urn:uuid:" references
+    # (transaction bundles, e.g. Synthea). Replaced for every bundle, so it stays small.
+    urn_map: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+
+    def resolve_reference(self, reference: str) -> Tuple[Optional[str], Optional[str]]:
+        """Like parse_fhir_reference, but also resolves urn: references within the current bundle."""
+        target_type, target_id = parse_fhir_reference(reference)
+        if target_type == 'urn' and reference in self.urn_map:
+            return self.urn_map[reference]
+        return target_type, target_id
+
     # Temporal tracking: incremental per-patient and per-type
     # _temporal_by_type:    {resource_type: [min_date, max_date, count]}
     # _temporal_by_patient: {patient_id:    [min_date, max_date]}
@@ -945,7 +983,7 @@ class RelationalAnalyzer:
         patient_id = None
         subject = resource.get('subject', {})
         if isinstance(subject, dict) and subject.get('reference'):
-            t, i = parse_fhir_reference(subject['reference'])
+            t, i = self.resolve_reference(subject['reference'])
             if t == 'Patient':
                 patient_id = i
 
@@ -1142,31 +1180,34 @@ class ScanResult:
 
 def scan_directory(
         root_dir: Path,
-        patterns: tuple = ("*.json", "*.ndjson"),
+        suffixes: tuple = (".json", ".ndjson", ".jsonl"),
         verbose: bool = True
 ) -> ScanResult:
-    """Recursively scan directory for JSON/NDJSON files."""
+    """Recursively scan a directory (all subfolders) for JSON/NDJSON files."""
     files = []
     total_size = 0
     errors = []
 
     root_dir = Path(root_dir)
 
-    if not root_dir.exists():
-        errors.append(f"Directory does not exist: {root_dir}")
+    if not root_dir.is_dir():
+        errors.append(f"Input directory does not exist or is not a directory: {root_dir}")
         return ScanResult(files=[], total_size_bytes=0, scan_errors=errors)
 
     if verbose:
         print(f"Scanning directory: {root_dir}")
 
-    for pattern in patterns:
-        for file_path in root_dir.rglob(pattern):
-            try:
-                if file_path.is_file():
-                    files.append(file_path)
+    suffixes = tuple(x.lower() for x in suffixes)
+    for dirpath, _, filenames in os.walk(root_dir, onerror=lambda e: errors.append(f"Cannot access {e.filename}: {e}")):
+        for name in filenames:
+            # "._name.json" are macOS metadata files, not FHIR
+            if name.lower().endswith(suffixes) and not name.startswith('._'):
+                file_path = Path(dirpath) / name
+                try:
                     total_size += file_path.stat().st_size
-            except (PermissionError, OSError) as e:
-                errors.append(f"Cannot access {file_path}: {e}")
+                    files.append(file_path)
+                except OSError as e:
+                    errors.append(f"Cannot access {file_path}: {e}")
 
     files.sort()
 
@@ -1181,12 +1222,21 @@ def scan_directory(
 # BUNDLE PARSING
 # =============================================================================
 
-def extract_resources_from_bundle(bundle: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
-    """Extract resources from a FHIR Bundle."""
+def extract_resources_from_bundle(
+        bundle: Dict[str, Any],
+        urn_map: Optional[Dict[str, Tuple[str, str]]] = None
+) -> Generator[Dict[str, Any], None, None]:
+    """Extract resources from a FHIR Bundle. Fills `urn_map` (fullUrl → (type, id)) for this bundle."""
     resource_type = bundle.get('resourceType')
 
     if resource_type == 'Bundle':
         entries = bundle.get('entry', [])
+        if urn_map is not None:
+            urn_map.clear()
+            for entry in entries:
+                res = entry.get('resource')
+                if entry.get('fullUrl') and isinstance(res, dict) and res.get('id'):
+                    urn_map[entry['fullUrl']] = (res.get('resourceType'), str(res['id']))
         for entry in entries:
             resource = entry.get('resource')
             if resource and isinstance(resource, dict):
@@ -1197,15 +1247,16 @@ def extract_resources_from_bundle(bundle: Dict[str, Any]) -> Generator[Dict[str,
 
 def extract_resources_from_file(
         file_path: Path,
-        errors: List[str]
+        errors: List[str],
+        urn_map: Optional[Dict[str, Tuple[str, str]]] = None
 ) -> Generator[Dict, None, None]:
     """Stream resources one by one from a JSON/NDJSON file."""
     try:
-        for obj in safe_json_load(file_path):
+        for obj in safe_json_load(file_path, errors):
             if not isinstance(obj, dict):
                 errors.append(f"Non-object JSON element in {file_path}")
                 continue
-            yield from extract_resources_from_bundle(obj)
+            yield from extract_resources_from_bundle(obj, urn_map)
     except Exception as e:
         errors.append(f"Error processing {file_path}: {e}")
 
@@ -1307,12 +1358,12 @@ class Aggregator:
         if resource_type in self.config.skip_types:
             return
 
-        # Deduplicate using known_ids: the same resource can appear in multiple files.
-        # Registering here also populates known_ids for reference integrity checks later.
+        # Register every ID for the reference integrity check. Only shared types (config.dedup_types) are
+        # skipped when seen again; other types are counted as found, because IDs are often reused between files.
         resource_id = resource.get('id')
         if resource_id:
             rt_ids = self.relational.known_ids[resource_type]
-            if resource_id in rt_ids:
+            if resource_id in rt_ids and resource_type in self.config.dedup_types:
                 self.dedup_counts[resource_type] += 1
                 return
             rt_ids.add(resource_id)
@@ -1355,8 +1406,8 @@ class Aggregator:
                 # Layer 1 (dict fingerprinting) + Layer 2 (field name) for complex types
                 field_stats.fhir_types[detect_fhir_type(value, field_name)] += 1
             else:  # array
+                # The list itself is not a value: value_count counts items only (format 3; format 1-2 counted it too)
                 field_stats.types_seen[python_type] += 1
-                field_stats.value_count += 1
 
             if not analyze:
                 continue
@@ -1369,7 +1420,7 @@ class Aggregator:
 
             elif python_type == 'object' and 'reference' in value:
                 ref_value = value['reference']
-                target_type, target_id = parse_fhir_reference(ref_value)
+                target_type, target_id = self.relational.resolve_reference(ref_value)
                 # Strip the leading "ResourceType." prefix to match the original path format
                 ref_path = path[rt_prefix_len:] if len(path) > rt_prefix_len else ''
                 self.relational.add_reference(
@@ -1848,7 +1899,7 @@ def write_run_summary(
         summary: dict,
         relational: RelationalAnalyzer,
         dedup_counts: Counter,
-        peak_mb: float,
+        peak_mb: Optional[float],
         all_errors: List[str],
         output_files: dict,
 ) -> Path:
@@ -1872,7 +1923,7 @@ def write_run_summary(
     lines.append(f"Started:   {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Finished:  {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Elapsed:   {_format_elapsed(elapsed)}")
-    lines.append(f"Peak RAM:  {peak_mb:.0f} MB")
+    lines.append(f"Peak RAM:  {_format_ram(peak_mb)}")
 
     _section("INPUT")
     size_mb = scan_result.total_size_bytes / (1024 * 1024)
@@ -1883,6 +1934,7 @@ def write_run_summary(
     lines.append(f"Top-N values:        {config.top_values_limit}")
     lines.append(f"Relational analysis: {'enabled' if config.analyze_relations else 'disabled'}")
     lines.append(f"Skip types:          {', '.join(sorted(config.skip_types)) or '(none)'}")
+    lines.append(f"Dedup types:         {', '.join(sorted(config.dedup_types)) or '(none)'}")
     lines.append(f"Inline extensions:   {'enabled' if config.inline_extensions else 'disabled'}")
     lines.append(f"HLL precision:       {config.hll_precision}")
 
@@ -1951,16 +2003,16 @@ def run_profiler(config: ProfilerConfig) -> dict:
         print("=" * 70)
 
     # Scan for files
-    scan_result = scan_directory(config.input_dir, patterns=config.file_patterns, verbose=verbose)
+    scan_result = scan_directory(config.input_dir, suffixes=config.file_suffixes, verbose=verbose)
 
     if not scan_result.files:
-        print("No JSON files found!")
+        for err in scan_result.scan_errors:
+            print(f"Error: {err}")
+        print(f"No {'/'.join(config.file_suffixes)} files found in {config.input_dir}")
         return {'error': 'No files found'}
 
     # Initialize aggregator
     aggregator = Aggregator(config)
-    if not tracemalloc.is_tracing():
-        tracemalloc.start()
 
     # Process files
     if verbose:
@@ -1971,7 +2023,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
 
     for idx, file_path in enumerate(scan_result.files, 1):
         try:
-            for resource in extract_resources_from_file(file_path, extraction_errors):
+            for resource in extract_resources_from_file(file_path, extraction_errors, aggregator.relational.urn_map):
                 aggregator.process_resource(resource)
             aggregator.mark_file_processed()
 
@@ -1982,9 +2034,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
         except Exception as e:
             extraction_errors.append(f"Fatal error processing {file_path}: {e}")
 
-    _, peak_bytes = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    peak_mb = peak_bytes / 1024 / 1024
+    peak_mb = _get_peak_ram_mb()
 
     # Get results
     results = aggregator.get_results()
@@ -2000,7 +2050,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
         print(f"  Resource types:   {len(summary['resource_types'])}")
         print(f"  Unique patients:  {len(relational.known_ids.get('Patient', set())):,}")
         print(f"  Unique encounters:{len(relational.known_ids.get('Encounter', set())):,}")
-        print(f"  Peak RAM:           {peak_mb:.0f} MB")
+        print(f"  Peak RAM:           {_format_ram(peak_mb)}")
         print("-" * 50)
 
     # Export all results
@@ -2018,7 +2068,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
                 f.write(f"{error}\n")
         output_files['_errors'] = error_file
         if verbose:
-            print(f"\nErrors written to: {error_file}")
+            print(f"\n{len(all_errors)} errors/warnings, e.g. invalid files, written to: {error_file}")
 
     elapsed = time.time() - start_time
 
@@ -2039,7 +2089,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
     output_files['_run_summary'] = summary_file
 
     if verbose:
-        print(f"\nDone! Elapsed: {elapsed:.2f}s | Peak RAM: {peak_mb:.0f} MB")
+        print(f"\nDone! Elapsed: {elapsed:.2f}s | Peak RAM: {_format_ram(peak_mb)}")
         print(f"\nOutput files:")
         for name, path in sorted(output_files.items()):
             print(f"  {path.name}")
@@ -2050,7 +2100,7 @@ def run_profiler(config: ProfilerConfig) -> dict:
         'resource_types': summary['resource_types'],
         'unique_patients': len(relational.known_ids.get('Patient', set())),
         'unique_encounters': len(relational.known_ids.get('Encounter', set())),
-        'peak_ram_mb': round(peak_mb, 1),
+        'peak_ram_mb': round(peak_mb, 1) if peak_mb is not None else None,
         'output_files': output_files,
         'elapsed_seconds': elapsed,
         'error_count': len(all_errors)
@@ -2082,15 +2132,23 @@ Examples:
     parser.add_argument('--no-relations', action='store_true', help='Skip relational analysis')
     parser.add_argument('--skip-types', type=str, default='',
                         help='Comma-separated resource types to exclude (e.g. Binary,DocumentReference)')
+    parser.add_argument('--dedup-types', type=str, default=None,
+                        help='Comma-separated resource types counted once even if they appear in several files '
+                             '(default: Medication,Location,Organization,Practitioner,PractitionerRole,Device,Substance)')
     parser.add_argument('--run-name', type=str, default=None,
                         help='Custom name for the output subfolder (default: timestamp)')
     parser.add_argument('--quiet', '-q', action='store_true', help='Suppress output')
 
     args = parser.parse_args()
 
+    extra = {}
+    if args.dedup_types is not None:
+        extra['dedup_types'] = {t.strip() for t in args.dedup_types.split(',') if t.strip()}
+
     config = ProfilerConfig(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
+        **extra,
         top_values_limit=args.top_n,
         hll_precision=args.hll_precision,
         hll_threshold=args.hll_threshold,
@@ -2106,12 +2164,4 @@ Examples:
 
 
 if __name__ == '__main__':
-    # For quick testing - hardcode your paths here
-    INPUT_DIR = Path("/Users/carlabhc/Documents/Test FHIR Data")  # ← Change this when necessary
-    OUTPUT_DIR = Path("/Users/carlabhc/Documents/Python Projects/FHIR_Dataset_Profiling/output")  # ← Change this when necessary
-
-    result = run_profiler(
-        ProfilerConfig(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, verbose=True)
-    )
-
-    print(f"\nResults: {result}")
+    main()

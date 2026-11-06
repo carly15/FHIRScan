@@ -116,10 +116,10 @@ except ImportError:
 
 _BERLIN_TZ = ZoneInfo('Europe/Berlin')
 
-# Output format 1 = runs before Nov 2026 (no version line, no year counts).
-# Format changes are additive only, so the DIZ report reads every format.
+# Format 1: runs before Nov 2026. Format 2: + version line, year counts.
+# Format 3: value_count no longer counts lists themselves (only items). The DIZ report reads every format.
 FHIRSCAN_VERSION = "2026.11"
-OUTPUT_FORMAT = 2
+OUTPUT_FORMAT = 3
 
 
 # =============================================================================
@@ -1591,8 +1591,8 @@ class Aggregator:
                     field_name = path.rstrip('[]').rsplit('.', 1)[-1]
                     field_stats.fhir_types[detect_fhir_type(value, field_name)] += 1
             else:  # array
+                # The list itself is not a value: value_count counts items only (format 3; format 1-2 counted it too)
                 field_stats.types_seen[python_type] += 1
-                field_stats.value_count += 1
 
             if not analyze:
                 continue

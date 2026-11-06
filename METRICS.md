@@ -50,7 +50,7 @@ The most detailed output. Contains value statistics for every observed field pat
 | `total_resources` | Total resources of this type |
 | `presence_rate` | `resources_with_field / total_resources` (see note below) |
 | `missing_rate` | `1 - presence_rate` |
-| `value_count` | **Total values seen including duplicates.** For repeated elements (e.g. `coding` arrays) this can exceed `resources_with_field` |
+| `value_count` | **Total values seen including duplicates.** For repeated elements (e.g. `coding` arrays) this can exceed `resources_with_field`. Lists themselves are not counted, only their items (output format 3; runs of format 1 and 2 additionally counted every list once, so `value_count` was inflated for list fields) |
 | `unique_count` | Number of **distinct** values observed |
 | `unique_count_approximate` | `True` if the distinct count is a HyperLogLog estimate rather than an exact count (triggered above ~1 000 distinct values) |
 | `detected_python_types` | Observed Python types for this field |
