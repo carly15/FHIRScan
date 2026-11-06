@@ -101,6 +101,30 @@ Checks whether resources are properly linked to patients and encounters.
 
 ---
 
+## v2: outputs per group (`scripts/v2/`, output format 4)
+
+Observation, Procedure and others are used for very different things, so v2 profiles each resource type
+additionally per group. The group comes from one fixed field per resource type (`groups.py`): `category`
+for Observation, Procedure, Condition, DiagnosticReport, CarePlan, Consent, MedicationRequest,
+MedicationAdministration and ServiceRequest, `class` for Encounter, `code` for List. All other types are
+not split. The group values are found during the scan, nothing has to be configured per site.
+
+| File | Content |
+|---|---|
+| `{ResourceType}_by_{field}_fields.csv` | Same columns as `{ResourceType}_fields.csv`, plus `group` as first column |
+| `03_cardinality_by_group.csv` | Same as `03_cardinality.csv`, plus `group` |
+| `04_data_quality_by_group.csv` | Same as `04_data_quality.csv`, plus `group` |
+
+- `group` is the sorted list of codes of the category (`system|code`, joined with ` + `), `(ohne)` if the
+  field is empty, `(andere)` beyond the 20th group of a resource type (`--max-groups`).
+- A resource with several categories is counted in the first group only; the run summary lists how many.
+- All v1 files are still written. The per-type values are the sum of the groups: counts and numeric
+  statistics are exact; `top_values` and `unique_count` are merged from the groups and exact until a field
+  exceeds 10,000 distinct values (then approximate, as in v1).
+- `--no-split` turns grouping off.
+
+---
+
 ## Key distinctions
 
 **`presence_rate` vs. `coverage_rate`**

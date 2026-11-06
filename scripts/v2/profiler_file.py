@@ -1,0 +1,2254 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Carla Schlüter, Bavarian Health Cloud GmbH
+# SPDX-License-Identifier: MIT
+"""
+FHIRScan v2 — FHIR Dataset Profiler
+====================================
+
+v2: Every resource type is additionally profiled per group, e.g. Observation per category and Encounter
+per class (see groups.py). All per-type outputs of v1 are still written (the type level is the merge of
+its groups), plus *_by_<field>_fields.csv, 03_cardinality_by_group.csv and 04_data_quality_by_group.csv.
+
+Analysiert FHIR-Datensatze (HL7 FHIR R4B) im JSON- und NDJSON-Format und erstellt
+ein umfassendes statistisches Profil über alle enthaltenen Ressourcen und Felder.
+
+Funktionsweise
+--------------
+1. **Einlesen**: Liest FHIR-Bundles rekursiv aus einem Eingabeverzeichnis (JSON/NDJSON).
+2. **Extraktion**: Extrahiert einzelne Ressourcen und gruppiert sie nach `resourceType`
+   (z. B. Patient, Encounter, Observation).
+3. **Feldtraversierung**: Traversiert jeden Ressourceneintrag rekursiv und generiert
+   vollständige Feldpfade (z. B. `subject.reference`, `code.coding[].system`).
+4. **Statistiken**: Akkumuliert je Feldpfad und Ressourcentyp:
+   - Vorkommen und Vollständigkeit (presence rate)
+   - Datentypen (FHIR R4B-spezifisch: CodeableConcept, Reference, Period, ...)
+   - Werteverteilung (Top-N-Werte, Kardinalität via HyperLogLog)
+   - Numerische Kennzahlen (Min, Max, Mittelwert, Standardabweichung)
+5. **Relationale Analyse**:
+   - Kardinalitäten (Ressourcen je Patient / Encounter)
+   - Referenzintegrität (dangling references)
+   - Zeitliche Verteilung der Ressourcen
+   - Strukturtiefe und Komplexitätsmetriken
+   - Data Quality Score je Ressourcentyp
+6. **Export**: Schreibt die Ergebnisse als CSV-Dateien in das Ausgabeverzeichnis.
+
+Verwendung
+----------
+    python profiler_file.py <input_dir> <output_dir> [Optionen]
+
+Optionen
+--------
+    --top-n N             Anzahl der häufigsten Werte je Feld (Standard: 20)
+    --skip-types TYPEN    Kommagetrennte Ressourcentypen ausschließen (z. B. Binary)
+    --dedup-types TYPEN   Ressourcentypen, die bei mehrfachem Vorkommen nur einmal zählen
+                          (Standard: Medication,Location,Organization,Practitioner,
+                          PractitionerRole,Device,Substance)
+    --run-name NAME       Eigener Name für den Ausgabeordner (Standard: Zeitstempel)
+    --no-relations        Relationale Analyse deaktivieren
+    --quiet               Keine Fortschrittsausgabe
+
+Contents
+--------
+To jump to a section, search (Ctrl/Cmd+F) for the heading text shown below.
+Named classes and functions are also listed in your IDE's Outline/Structure panel.
+
+    profiler_file.py
+    ├── CONFIGURATION ──────── ProfilerConfig
+    ├── UTILITIES ──────────── safe_json_load · get_python_type · _check_output_writable
+    ├── FHIR R4B TYPE DETECTION  detect_fhir_type · parse_fhir_reference
+    │                            parse_fhir_datetime
+    ├── HYPERLOGLOG ────────── HyperLogLog
+    ├── FIELD STATISTICS ───── FieldStatistics · ResourceTypeStatistics
+    ├── RELATIONAL STATISTICS  CardinalityStats · RelationalAnalyzer
+    ├── FILE SCANNING ──────── ScanResult · scan_directory
+    ├── BUNDLE PARSING ─────── extract_resources_from_bundle
+    │                          extract_resources_from_file
+    ├── PATH TRAVERSAL ─────── traverse_resource
+    ├── AGGREGATOR ─────────── Aggregator
+    ├── EXPORT FUNCTIONS ───── export_resource_type_csv · export_cardinality_csv
+    │                          export_data_quality_csv · export_summary_csv
+    │                          export_summary_details_csv · export_all_results
+    │                          _format_elapsed · write_run_summary
+    ├── MAIN PROFILER ──────── run_profiler
+    └── CLI ENTRY POINT ────── main()
+"""
+
+import sys
+import time
+import json
+import csv
+import math
+import hashlib
+import argparse
+import re
+from pathlib import Path
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple
+from datetime import datetime, timedelta
+
+from groups import (SPLIT_FIELDS, MAX_GROUPS, GROUP_SEP, group_keys, assign_group, merge_type_stats)
+import array
+import statistics
+import os
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore[import]
+
+_BERLIN_TZ = ZoneInfo('Europe/Berlin')
+
+# Format 1: runs before Nov 2026. Format 2: + version line, year counts.
+# Format 3: value_count no longer counts lists themselves (only items).
+# Format 4 (v2): additional per-group outputs; top values and distinct counts per type are merged from the
+#                groups (exact until a field switches to HyperLogLog). The DIZ report reads every format.
+FHIRSCAN_VERSION = "2.0"
+OUTPUT_FORMAT = 4
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+@dataclass
+class ProfilerConfig:
+    """Configuration for the FHIR dataset profiler."""
+
+    input_dir: Path
+    output_dir: Path
+    top_values_limit: int = 20
+    max_value_length: int = 200
+    hll_precision: int = 14
+    hll_threshold: int = 10000
+    inline_extensions: bool = True
+    file_suffixes: tuple = (".json", ".ndjson", ".jsonl")   # matched case-insensitively, in all subfolders
+    verbose: bool = True
+    run_name: Optional[str] = None          # custom output subfolder name; defaults to timestamp
+    skip_types: Set[str] = field(default_factory=set)  # resource types to exclude from profiling
+    # Shared resources that legitimately appear in several files and are counted once. All other types
+    # are counted as found: local IDs are often reused between bundles (e.g. Patient/1 in every file).
+    dedup_types: Set[str] = field(default_factory=lambda: {
+        'Medication', 'Location', 'Organization', 'Practitioner', 'PractitionerRole', 'Device', 'Substance'})
+
+    # Grouping (v2): profile each resource type per group of its SPLIT_FIELDS field, e.g. Observation.category
+    split: bool = True
+    max_groups: int = MAX_GROUPS
+
+    # Relational analysis settings
+    analyze_relations: bool = True
+    primary_anchors: tuple = ("Patient", "Encounter")  # Main entities to pivot around
+
+    def __post_init__(self):
+        self.input_dir = Path(self.input_dir)
+        self.output_dir = Path(self.output_dir)
+
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
+def safe_json_load(file_path: Path, errors: List[str]) -> Generator[dict, None, None]:
+    """Load JSON or NDJSON file, yielding parsed objects. Invalid content is appended to `errors`."""
+    # utf-8-sig: files saved by Windows tools often start with a byte order mark
+    with open(file_path, 'r', encoding='utf-8-sig') as f:
+        if file_path.suffix.lower() in ('.ndjson', '.jsonl'):
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if line:
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError as e:
+                        errors.append(f"Invalid JSON at {file_path}:{line_num}: {e}")
+        else:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError as e:
+                errors.append(f"Invalid JSON in {file_path}: {e}")
+                return
+            if isinstance(data, list):
+                yield from data
+            else:
+                yield data
+
+
+def get_python_type(value: Any) -> str:
+    """Get a readable type name for a value."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "dictionary"
+    return type(value).__name__
+
+
+def _check_output_writable(output_dir: Path) -> bool:
+    """Verify output_dir is writable before starting a long run."""
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        test_file = output_dir / '.write_test'
+        test_file.touch()
+        test_file.unlink()
+        return True
+    except (PermissionError, OSError) as e:
+        print(f"Error: output directory is not writable: {output_dir}\n  {e}")
+        return False
+
+
+def _get_peak_ram_mb() -> Optional[float]:
+    """Peak resident memory (RSS) of this process in MB, read from the OS (no overhead).
+
+    Replaces tracemalloc, which hooks every allocation and slowed parsing down ~6x.
+    Returns None on Windows, where the resource module is unavailable.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # ru_maxrss is bytes on macOS, kilobytes on Linux
+    return peak / 1024 / 1024 if sys.platform == 'darwin' else peak / 1024
+
+
+def _format_ram(mb: Optional[float]) -> str:
+    return f"{mb:.0f} MB" if mb is not None else "n/a"
+
+
+# =============================================================================
+# FHIR R4B TYPE DETECTION
+# =============================================================================
+# Two-layer strategy:
+#   Layer 1: Structural fingerprinting of the actual JSON value (bool/float/int/dict/str)
+#   Layer 2: Field-name lookup — FHIR field names are normative per the R4B spec
+# Reference: https://hl7.org/fhir/R4B/datatypes.html
+
+# Compiled regex patterns for narrowing JSON string values to FHIR primitives
+_RE_INSTANT  = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$')
+_RE_DATETIME = re.compile(r'^\d{4}(?:-\d{2}(?:-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?)?)?$')
+_RE_DATE     = re.compile(r'^\d{4}(?:-\d{2}(?:-\d{2})?)?$')
+_RE_TIME     = re.compile(r'^\d{2}:\d{2}:\d{2}(?:\.\d+)?$')
+_RE_OID      = re.compile(r'^urn:oid:[\d.]+$')
+_RE_UUID     = re.compile(r'^urn:uuid:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+_RE_URI      = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.-]*:')
+_RE_BASE64   = re.compile(r'^[A-Za-z0-9+/]*={0,2}$')
+_RE_ID       = re.compile(r'^[A-Za-z0-9.-]{1,64}$')
+
+# ContactPoint.system values (FHIR bound ValueSet — R4B §4.6.4)
+_CONTACT_POINT_SYSTEMS: Set[str] = {'phone', 'fax', 'email', 'pager', 'url', 'sms', 'other'}
+
+# Field names that reliably carry base64Binary data (Attachment.data, Attachment.hash)
+_BASE64_FIELD_NAMES: Set[str] = {'data', 'hash'}
+
+# Field names that reliably carry markdown content
+_MARKDOWN_FIELD_NAMES: Set[str] = {'requirements', 'copyright', 'purpose', 'comment', 'description'}
+
+# Direct mapping of FHIR R4B field names to their declared complex datatype.
+# Field names are normative in the spec — more reliable than inspecting object keys.
+# Reference: https://hl7.org/fhir/R4B/datatypes.html
+_FHIR_FIELD_TYPES: Dict[str, str] = {
+    # HumanName
+    'name':                 'HumanName',
+    # Address
+    'address':              'Address',
+    # ContactPoint
+    'telecom':              'ContactPoint',
+    # Identifier
+    'identifier':           'Identifier',
+    # Period
+    'period':               'Period',
+    'effectivePeriod':      'Period',
+    'billablePeriod':       'Period',
+    'requestedPeriod':      'Period',
+    # CodeableConcept — field names that are universally CodeableConcept across resources
+    'code':                 'CodeableConcept',
+    'category':             'CodeableConcept',
+    'type':                 'CodeableConcept',
+    'reasonCode':           'CodeableConcept',
+    'bodySite':             'CodeableConcept',
+    'site':                 'CodeableConcept',
+    'route':                'CodeableConcept',
+    'method':               'CodeableConcept',
+    'severity':             'CodeableConcept',
+    'criticality':          'CodeableConcept',
+    'interpretation':       'CodeableConcept',
+    'dataAbsentReason':     'CodeableConcept',
+    'admitSource':          'CodeableConcept',
+    'dischargeDisposition': 'CodeableConcept',
+    'specialArrangement':   'CodeableConcept',
+    'specialCourtesy':      'CodeableConcept',
+    'priority':             'CodeableConcept',
+    'relationship':         'CodeableConcept',
+    'complication':         'CodeableConcept',
+    'outcome':              'CodeableConcept',
+    # Coding (Encounter.class and a few others are Coding, not CodeableConcept)
+    'coding':               'Coding',
+    'class':                'Coding',
+    # Reference — common subject/context fields
+    'subject':              'Reference',
+    'patient':              'Reference',
+    'encounter':            'Reference',
+    'author':               'Reference',
+    'recorder':             'Reference',
+    'asserter':             'Reference',
+    'requester':            'Reference',
+    'performer':            'Reference',
+    'location':             'Reference',
+    'partOf':               'Reference',
+    'basedOn':              'Reference',
+    'focus':                'Reference',
+    'hasMember':            'Reference',
+    'derivedFrom':          'Reference',
+    'managingOrganization': 'Reference',
+    'generalPractitioner':  'Reference',
+    'serviceProvider':      'Reference',
+    'payor':                'Reference',
+    'insurer':              'Reference',
+    # Quantity
+    'quantity':             'Quantity',
+    'doseQuantity':         'Quantity',
+    # Age (constrained Quantity)
+    'age':                  'Age',
+    # Duration (constrained Quantity)
+    'duration':             'Duration',
+    # Annotation
+    'note':                 'Annotation',
+    # Attachment
+    'photo':                'Attachment',
+    # Timing
+    'timing':               'Timing',
+    # Money
+    'net':                  'Money',
+    'unitPrice':            'Money',
+    'amount':               'Money',
+    # Signature
+    'signature':            'Signature',
+    # Special resource-level types
+    'text':                 'Narrative',
+    'meta':                 'Meta',
+}
+
+# FHIR type name suffixes used in value[x] polymorphic fields.
+# e.g. valueQuantity → Quantity, onsetAge → Age, scheduledTiming → Timing.
+# Ordered longest-first so 'CodeableConcept' is checked before shorter suffixes.
+_FHIR_TYPE_SUFFIXES: List[Tuple[str, str]] = [
+    ('CodeableConcept', 'CodeableConcept'),
+    ('SampledData',     'SampledData'),
+    ('ContactPoint',    'ContactPoint'),
+    ('HumanName',       'HumanName'),
+    ('Identifier',      'Identifier'),
+    ('Attachment',      'Attachment'),
+    ('Annotation',      'Annotation'),
+    ('Reference',       'Reference'),
+    ('Quantity',        'Quantity'),
+    ('Duration',        'Duration'),
+    ('Distance',        'Distance'),
+    ('Signature',       'Signature'),
+    ('Timing',          'Timing'),
+    ('Address',         'Address'),
+    ('Period',          'Period'),
+    ('Range',           'Range'),
+    ('Ratio',           'Ratio'),
+    ('Money',           'Money'),
+    ('Count',           'Count'),
+    ('Age',             'Age'),
+]
+
+
+def _fingerprint_dict(d: dict) -> Optional[str]:
+    """
+    Layer 1a: Identify a FHIR complex type by the keys present in a dict value.
+
+    Key combinations that uniquely fingerprint each type are checked in order
+    from most-distinctive to least-distinctive to avoid false positives.
+    Returns the FHIR type name, or None if no fingerprint matches conclusively.
+    """
+    keys = d.keys()
+
+    # Reference: 'reference' string key is unique to this type
+    if 'reference' in keys:
+        return 'Reference'
+
+    # CodeableConcept: always has a 'coding' sub-array
+    if 'coding' in keys:
+        return 'CodeableConcept'
+
+    # Ratio: numerator + denominator (both Quantity-like objects)
+    if 'numerator' in keys or 'denominator' in keys:
+        return 'Ratio'
+
+    # SampledData: origin (Quantity) + period (decimal) + data (string) — unique triple
+    if 'origin' in keys and 'period' in keys and 'data' in keys:
+        return 'SampledData'
+
+    # Signature: type (Coding[]) + when (instant) + who (Reference)
+    if 'type' in keys and 'when' in keys and 'who' in keys:
+        return 'Signature'
+
+    # Narrative: 'div' key is unique to Narrative
+    if 'div' in keys:
+        return 'Narrative'
+
+    # Meta: versionId and lastUpdated are unique meta fields
+    if 'versionId' in keys or 'lastUpdated' in keys:
+        return 'Meta'
+
+    # Period: start and/or end (dateTime strings); exclude Range keys to avoid collision
+    if ('start' in keys or 'end' in keys) and 'low' not in keys and 'high' not in keys:
+        return 'Period'
+
+    # Range: low and/or high (SimpleQuantity objects)
+    if 'low' in keys or 'high' in keys:
+        return 'Range'
+
+    # Coding: system + code, no 'coding' sub-key, no numeric 'value'
+    if 'system' in keys and 'code' in keys and 'value' not in keys:
+        return 'Coding'
+
+    # Quantity and constrained types (Age, Duration, Count, Distance, Money):
+    # numeric 'value' is the key differentiator from ContactPoint/Identifier
+    if 'value' in keys and isinstance(d.get('value'), (int, float)):
+        if 'currency' in keys:
+            return 'Money'
+        return 'Quantity'  # Age/Duration/Count/Distance share same keys; field name resolves them (Layer 2)
+
+    # Annotation: text + time or author field
+    if 'text' in keys and ('time' in keys or 'authorReference' in keys or 'authorString' in keys):
+        return 'Annotation'
+
+    # Attachment: contentType is unique; url+size also works
+    if 'contentType' in keys or ('url' in keys and 'size' in keys):
+        return 'Attachment'
+
+    # Timing: 'repeat' BackboneElement is distinctive
+    if 'repeat' in keys:
+        return 'Timing'
+
+    # HumanName: family and given are unique to HumanName
+    if 'family' in keys or 'given' in keys:
+        return 'HumanName'
+
+    # Address: city / postalCode / country / line are unique to Address
+    if 'city' in keys or 'postalCode' in keys or 'country' in keys or 'line' in keys:
+        return 'Address'
+
+    # ContactPoint vs Identifier: both have system + value (string)
+    # Distinguish by checking system value against the ContactPoint bound ValueSet
+    if 'system' in keys and 'value' in keys and isinstance(d.get('value'), str):
+        if d.get('system') in _CONTACT_POINT_SYSTEMS:
+            return 'ContactPoint'
+        return 'Identifier'
+
+    return None
+
+
+def _narrow_string(s: str, field_name: str) -> str:
+    """
+    Layer 1b: Narrow a JSON string to the most specific FHIR primitive type.
+
+    Checks in order of decreasing specificity so a more-specific pattern
+    (e.g. instant) always takes precedence over a broader one (e.g. dateTime).
+    """
+    # xhtml: Narrative.div always starts with an XML tag
+    if field_name == 'div' and s.startswith('<'):
+        return 'xhtml'
+
+    # base64Binary: field name is the most reliable signal
+    if field_name in _BASE64_FIELD_NAMES and _RE_BASE64.fullmatch(s):
+        return 'base64Binary'
+
+    # uuid (urn:uuid:...) — must precede the generic uri check
+    if _RE_UUID.fullmatch(s):
+        return 'uuid'
+
+    # oid (urn:oid:...) — must precede the generic uri check
+    if _RE_OID.fullmatch(s):
+        return 'oid'
+
+    # instant: full datetime with mandatory timezone — most specific datetime form
+    if _RE_INSTANT.fullmatch(s):
+        return 'instant'
+
+    # dateTime: has a time component (T separator) but no/optional timezone
+    if 'T' in s and _RE_DATETIME.fullmatch(s):
+        return 'dateTime'
+
+    # date: date-only form (YYYY, YYYY-MM, YYYY-MM-DD) — no time component
+    if _RE_DATE.fullmatch(s):
+        return 'date'
+
+    # time: HH:MM:SS[.sss]
+    if _RE_TIME.fullmatch(s):
+        return 'time'
+
+    # canonical: versioned URL (url|version) — must precede the generic uri check
+    if '|' in s and _RE_URI.match(s.split('|')[0]):
+        return 'canonical'
+
+    # uri / url: any scheme-based URI
+    if _RE_URI.match(s):
+        return 'uri'
+
+    # markdown: field name signals intent; markdown syntax in value confirms it
+    if field_name in _MARKDOWN_FIELD_NAMES and any(m in s for m in ('**', '\n#', '\n-', '\n*')):
+        return 'markdown'
+
+    # id: FHIR id type — only for field names that semantically carry an id value
+    # (id regex overlaps with code; field name is the reliable disambiguator)
+    if field_name in ('id', 'versionId', 'linkId', 'groupingId') and _RE_ID.fullmatch(s):
+        return 'id'
+
+    # code: no whitespace, reasonably short (catches FHIR code values like 'active', 'male')
+    if ' ' not in s and len(s) <= 100:
+        return 'code'
+
+    return 'string'
+
+
+def detect_fhir_type(value: Any, field_name: str) -> str:
+    """
+    Return the most specific FHIR R4B datatype name for a field value.
+
+    Two-layer strategy:
+    Layer 1 — Structural fingerprinting of the value itself:
+        bool   → 'boolean'
+        float  → 'decimal'
+        int    → 'integer' (or 'positiveInt'/'unsignedInt' by field name)
+        dict   → fingerprint key set → complex FHIR type, or fall through to Layer 2
+        str    → regex narrowing → specific FHIR primitive
+
+    Layer 2 — Field-name lookup (fallback when structure is ambiguous):
+        Direct dict lookup in _FHIR_FIELD_TYPES
+        value[x] suffix matching in _FHIR_TYPE_SUFFIXES
+
+    Always returns a non-empty string; returns 'unknown' if nothing matches.
+    """
+    # Note: bool must be checked before int — bool is a subclass of int in Python
+    if isinstance(value, bool):
+        return 'boolean'
+
+    if isinstance(value, float):
+        return 'decimal'
+
+    if isinstance(value, int):
+        # Disambiguate integer subtypes by field-name convention
+        if field_name in ('count', 'frequency', 'frequencyMax', 'durationMax', 'periodMax'):
+            return 'positiveInt'
+        if field_name == 'offset':
+            return 'unsignedInt'
+        return 'integer'
+
+    if isinstance(value, dict):
+        fhir_type = _fingerprint_dict(value)
+        if fhir_type:
+            return fhir_type
+        # Fall through to Layer 2 when fingerprint is inconclusive
+
+    if isinstance(value, str):
+        return _narrow_string(value, field_name)
+
+    # Layer 2: field-name lookup
+    if field_name in _FHIR_FIELD_TYPES:
+        return _FHIR_FIELD_TYPES[field_name]
+
+    for suffix, fhir_type in _FHIR_TYPE_SUFFIXES:
+        if field_name.endswith(suffix) and len(field_name) > len(suffix):
+            return fhir_type
+
+    return 'unknown'
+
+
+def parse_fhir_reference(reference: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Parse a FHIR reference string into (resourceType, id).
+
+    Handles formats:
+    - "Patient/123"
+    - "urn:uuid:abc-def"
+    - "https://example.org/fhir/Patient/123"
+    """
+    if not reference:
+        return None, None
+
+    # Handle relative references: "Patient/123"
+    if '/' in reference and not reference.startswith('http'):
+        parts = reference.split('/')
+        if len(parts) >= 2:
+            # Take last two parts (handles "Patient/123" and longer paths)
+            return parts[-2], parts[-1]
+
+    # Handle URN references: "urn:uuid:abc-def"
+    if reference.startswith('urn:'):
+        return 'urn', reference
+
+    # Handle absolute URLs
+    if reference.startswith('http'):
+        # Try to extract ResourceType/id from URL
+        match = re.search(r'/([A-Z][a-zA-Z]+)/([^/]+)$', reference)
+        if match:
+            return match.group(1), match.group(2)
+
+    return None, reference
+
+
+def parse_fhir_datetime(value: str) -> Optional[datetime]:
+    """Parse a FHIR datetime string and return it normalized to Europe/Berlin.
+
+    Naive datetimes (no timezone in the string) are assumed to already be Berlin
+    local time and are stamped accordingly.  Timezone-aware datetimes are converted
+    to Berlin time.  This ensures all datetimes are comparable without TypeError.
+    """
+    if not value or not isinstance(value, str):
+        return None
+
+    formats = [
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%d",
+        "%Y-%m",
+        "%Y"
+    ]
+
+    # Strip the colon from timezone offsets (e.g. "+05:30" → "+0530") for strptime compatibility
+    value_clean = re.sub(r'(\+|-)(\d{2}):(\d{2})$', r'\1\2\3', value)
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(value_clean, fmt)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=_BERLIN_TZ)   # assume Berlin local time
+            return dt.astimezone(_BERLIN_TZ)            # convert any other TZ to Berlin
+        except ValueError:
+            continue
+
+    return None
+
+
+# =============================================================================
+# HYPERLOGLOG IMPLEMENTATION
+# =============================================================================
+
+class HyperLogLog:
+    """HyperLogLog cardinality estimator."""
+
+    def __init__(self, precision: int = 14):
+        if not 4 <= precision <= 16:
+            raise ValueError("Precision must be between 4 and 16")
+
+        self.p = precision          # bits used to select which register to update
+        self.m = 1 << precision     # total number of registers (2^p)
+        self.registers = bytearray(self.m)  # each register holds the max leading-zero rank seen for its bucket
+
+        # alpha: bias-correction constant; exact values for small m, formula for larger m
+        if self.m == 16:
+            self.alpha = 0.673
+        elif self.m == 32:
+            self.alpha = 0.697
+        elif self.m == 64:
+            self.alpha = 0.709
+        else:
+            self.alpha = 0.7213 / (1 + 1.079 / self.m)
+
+    @staticmethod
+    def _hash(value: Any) -> int:
+        # Produce a 64-bit integer hash from any value via SHA-256 (first 8 bytes)
+        str_repr = str(value).encode('utf-8')
+        hash_bytes = hashlib.sha256(str_repr).digest()[:8]
+        return int.from_bytes(hash_bytes, 'big')
+
+    @staticmethod
+    def _leading_zeros(value: int, max_bits: int = 64) -> int:
+        # Count leading zero bits within a max_bits-wide integer
+        # Used to compute the "rank" (position of the first 1-bit)
+        if value == 0:
+            return max_bits
+        return max_bits - value.bit_length()
+
+    def add(self, value: Any) -> None:
+        h = self._hash(value)
+        register_idx = h >> (64 - self.p)              # top p bits → which register to update
+        remaining = h & ((1 << (64 - self.p)) - 1)    # remaining bits used for rank computation
+        rank = self._leading_zeros(remaining, 64 - self.p) + 1  # rank = leading zeros + 1
+        self.registers[register_idx] = max(self.registers[register_idx], rank)  # keep max rank per register
+
+    def count(self) -> int:
+        # Core HLL estimate: harmonic mean of 2^(-register) scaled by alpha and m^2
+        indicator = sum(2.0 ** (-r) for r in self.registers)
+        estimate = self.alpha * self.m * self.m / indicator
+
+        # Small range correction: switch to linear counting when many registers are still empty
+        if estimate <= 2.5 * self.m:
+            zeros = self.registers.count(0)  # registers that have never been updated
+            if zeros > 0:
+                estimate = self.m * math.log(self.m / zeros)
+        # Large range correction: compensate for 64-bit hash space saturation
+        elif estimate > (1 << 32) / 30:
+            estimate = -(1 << 64) * math.log(1 - estimate / (1 << 64))
+
+        return int(estimate)
+
+    def merge(self, other: 'HyperLogLog') -> None:
+        if self.p != other.p:
+            raise ValueError("Cannot merge HyperLogLogs with different precision")
+        # Take the element-wise max of both register arrays (equivalent to a union)
+        for i in range(self.m):
+            self.registers[i] = max(self.registers[i], other.registers[i])
+
+
+# =============================================================================
+# FIELD STATISTICS
+# =============================================================================
+
+@dataclass
+class FieldStatistics:
+    """Statistics for a single field path."""
+
+    path: str
+    resource_count: int = 0           # how many resources contained this field (presence count)
+    value_count: int = 0              # total values seen, including duplicates
+    types_seen: Counter = field(default_factory=Counter)         # frequency of each Python type (string, integer, etc.)
+    exact_values: Optional[Set[str]] = field(default_factory=set)  # distinct values stored exactly (before HLL threshold)
+    value_counter: Counter = field(default_factory=Counter)      # frequency of each value string (for top-N output)
+    hll: Optional[HyperLogLog] = None      # approximate unique counter, activated after threshold is exceeded
+    hll_precision: int = 14
+    hll_threshold: int = 10000
+    top_n: int = 20
+    max_value_length: int = 200
+    fhir_types: Counter = field(default_factory=Counter)  # detected FHIR complex type(s) when field is an object
+    _hll_sample: Optional[list] = field(default=None, init=False, repr=False)  # top-N snapshot saved at HLL switch
+
+    # Numeric statistics accumulated via Welford's online algorithm (no list of values stored)
+    numeric_count: int = 0
+    numeric_min: Optional[float] = None
+    numeric_max: Optional[float] = None
+    _numeric_mean: float = field(default=0.0, init=False, repr=False)
+    _numeric_M2: float = field(default=0.0, init=False, repr=False)
+
+    def add_value(self, value: Any, python_type: str) -> None:
+        self.value_count += 1
+        self.types_seen[python_type] += 1
+
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            fv = float(value)
+            self.numeric_count += 1
+            if self.numeric_min is None or fv < self.numeric_min:
+                self.numeric_min = fv
+            if self.numeric_max is None or fv > self.numeric_max:
+                self.numeric_max = fv
+            delta = fv - self._numeric_mean
+            self._numeric_mean += delta / self.numeric_count
+            self._numeric_M2 += delta * (fv - self._numeric_mean)
+
+        str_value = str(value)
+        # Truncate very long values to avoid excessive memory use
+        if len(str_value) > self.max_value_length:
+            str_value = str_value[:self.max_value_length - 3] + "..."
+
+        if self.hll is not None:
+            self.hll.add(str_value)
+        else:
+            self.value_counter[str_value] += 1  # only while cardinality is below threshold
+            assert self.exact_values is not None  # exact_values is cleared only when hll is set
+            self.exact_values.add(str_value)
+            # Once distinct values exceed the threshold, switch to approximate counting
+            if len(self.exact_values) > self.hll_threshold:
+                self._switch_to_hll()
+
+    def _switch_to_hll(self) -> None:
+        # Migrate all exact values into a HyperLogLog, then free the set
+        assert self.exact_values is not None
+        self.hll = HyperLogLog(self.hll_precision)
+        for val in self.exact_values:
+            self.hll.add(val)
+        self.exact_values = None
+        # Save top-N snapshot as format examples; clear counter (won't be updated further)
+        self._hll_sample = self.value_counter.most_common(self.top_n)
+        self.value_counter = Counter()
+
+    def mark_resource_presence(self) -> None:
+        self.resource_count += 1
+
+    @property
+    def unique_count(self) -> int:
+        if self.hll is not None:
+            return self.hll.count()
+        return len(self.exact_values) if self.exact_values is not None else 0
+
+    @property
+    def unique_count_approximate(self) -> bool:
+        return self.hll is not None
+
+    @property
+    def top_values(self) -> List[tuple]:
+        if self.hll is not None:
+            return self._hll_sample or []
+        return self.value_counter.most_common(self.top_n)
+
+    @property
+    def detected_python_types(self) -> List[str]:
+        return [t for t, _ in self.types_seen.most_common()]
+
+    @property
+    def has_type_inconsistency(self) -> bool:
+        non_null_types = [t for t in self.types_seen if t != 'null']
+        return len(non_null_types) > 1
+
+    @property
+    def detected_fhir_type(self) -> str:
+        """Most frequently detected FHIR complex datatype, or empty string if none."""
+        if not self.fhir_types:
+            return ''
+        return self.fhir_types.most_common(1)[0][0]
+
+    @property
+    def numeric_mean(self) -> Optional[float]:
+        return round(self._numeric_mean, 6) if self.numeric_count > 0 else None
+
+    @property
+    def numeric_stdev(self) -> Optional[float]:
+        if self.numeric_count < 2:
+            return None
+        return round(math.sqrt(self._numeric_M2 / (self.numeric_count - 1)), 6)
+
+
+@dataclass
+class ResourceTypeStatistics:
+    """Statistics for all fields within a resource type."""
+
+    resource_type: str
+    total_resources: int = 0
+    field_stats: Dict[str, FieldStatistics] = field(default_factory=dict)
+    hll_precision: int = 14
+    hll_threshold: int = 10000
+    top_n: int = 20
+    max_value_length: int = 200
+
+    def get_or_create_field(self, path: str) -> FieldStatistics:
+        if path not in self.field_stats:
+            self.field_stats[path] = FieldStatistics(
+                path=path,
+                hll_precision=self.hll_precision,
+                hll_threshold=self.hll_threshold,
+                top_n=self.top_n,
+                max_value_length=self.max_value_length
+            )
+        return self.field_stats[path]
+
+    def increment_resource_count(self) -> None:
+        self.total_resources += 1
+
+
+# =============================================================================
+# RELATIONAL STATISTICS
+# =============================================================================
+
+@dataclass
+class CardinalityStats:
+    """Statistics for cardinality distribution."""
+    counts: Any = field(default_factory=lambda: array.array('I'))
+
+    def add(self, count: int) -> None:
+        self.counts.append(count)
+
+    @property
+    def total_anchors(self) -> int:
+        return len(self.counts)
+
+    @property
+    def total_resources(self) -> int:
+        return sum(self.counts)
+
+    @property
+    def min_count(self) -> int:
+        return min(self.counts) if self.counts else 0
+
+    @property
+    def max_count(self) -> int:
+        return max(self.counts) if self.counts else 0
+
+    @property
+    def mean_count(self) -> float:
+        return statistics.mean(self.counts) if self.counts else 0.0
+
+    @property
+    def median_count(self) -> float:
+        return statistics.median(self.counts) if self.counts else 0.0
+
+    @property
+    def std_dev(self) -> float:
+        return statistics.stdev(self.counts) if len(self.counts) > 1 else 0.0
+
+    def percentile(self, p: int) -> float:
+        """Calculate a single percentile (0–100)."""
+        if not self.counts:
+            return 0.0
+        sorted_counts = sorted(self.counts)
+        idx = int(len(sorted_counts) * p / 100)
+        # Clamp index to last valid position (guards against p=100 going out of bounds)
+        return sorted_counts[min(idx, len(sorted_counts) - 1)]
+
+    def percentiles(self, *ps: int) -> Dict[int, float]:
+        """Calculate multiple percentiles in one sort — use when calling several at once."""
+        if not self.counts:
+            return {p: 0.0 for p in ps}
+        sorted_counts = sorted(self.counts)
+        n = len(sorted_counts)
+        return {p: sorted_counts[min(int(n * p / 100), n - 1)] for p in ps}
+
+    def to_dict(self) -> Dict[str, Any]:
+        pcts = self.percentiles(25, 75, 90, 99)
+        return {
+            'total_anchors': self.total_anchors,
+            'total_resources': self.total_resources,
+            'min': self.min_count,
+            'max': self.max_count,
+            'mean': round(self.mean_count, 2),
+            'median': self.median_count,
+            'std_dev': round(self.std_dev, 2),
+            'p25': pcts[25],
+            'p75': pcts[75],
+            'p90': pcts[90],
+            'p99': pcts[99],
+        }
+
+
+@dataclass
+class RelationalAnalyzer:
+    """Analyzes relationships between FHIR resources."""
+
+    # All resource IDs seen; used for deduplication and reference integrity checks
+    known_ids: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
+
+    # Reference integrity: pre-aggregated during traversal
+    # key = "SourceType.ref_path -> target_type"
+    _ref_totals: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    _ref_unknown_type: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    _ref_targets: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    _ref_examples: Dict[str, list] = field(default_factory=lambda: defaultdict(list))
+    _total_ref_count: int = field(default=0)
+
+    # How many resources of each type link to each patient/encounter ID
+    cardinality_by_patient: Dict[str, Dict[str, int]] = field(default_factory=lambda: defaultdict(Counter))
+    cardinality_by_encounter: Dict[str, Dict[str, int]] = field(default_factory=lambda: defaultdict(Counter))
+
+    # Maps Encounter ID → Patient ID (built while processing Encounter resources)
+    encounter_to_patient: Dict[str, str] = field(default_factory=dict)
+
+    # fullUrl → (resourceType, id) of the bundle being processed, to resolve "urn:uuid:" references
+    # (transaction bundles, e.g. Synthea). Replaced for every bundle, so it stays small.
+    urn_map: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+
+    def resolve_reference(self, reference: str) -> Tuple[Optional[str], Optional[str]]:
+        """Like parse_fhir_reference, but also resolves urn: references within the current bundle."""
+        target_type, target_id = parse_fhir_reference(reference)
+        if target_type == 'urn' and reference in self.urn_map:
+            return self.urn_map[reference]
+        return target_type, target_id
+
+    # Temporal tracking: incremental per-patient and per-type
+    # _temporal_by_type:    {resource_type: [min_date, max_date, count]}
+    # _temporal_by_patient: {patient_id:    [min_date, max_date]}
+    _temporal_by_type: Dict[str, list] = field(default_factory=lambda: defaultdict(lambda: [None, None, 0]))
+    _temporal_by_patient: Dict[str, list] = field(default_factory=lambda: defaultdict(lambda: [None, None]))
+    _temporal_count: int = field(default=0)
+    # Resources per calendar year {resource_type: Counter({year: n})} — appended to 06 as year_counts_by_type
+    _temporal_years: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+
+    # Maximum nesting depth per resource (array.array for compact int storage)
+    max_depths: Dict[str, Any] = field(default_factory=lambda: defaultdict(lambda: array.array('I')))
+    # Sizes of every array encountered, keyed by resource type
+    array_sizes: Dict[str, Any] = field(default_factory=lambda: defaultdict(lambda: array.array('I')))
+
+    # Counts for patient/encounter linkage quality metrics
+    resources_with_patient_ref: Dict[str, int] = field(default_factory=Counter)
+    resources_without_patient_ref: Dict[str, int] = field(default_factory=Counter)
+    resources_with_encounter_ref: Dict[str, int] = field(default_factory=Counter)
+
+    def add_reference(self, source_type: str, source_id: str, ref_path: str,
+                      target_type: Optional[str], target_id: Optional[str],
+                      raw_reference: str) -> None:
+        """Accumulate a reference for integrity analysis."""
+        self._total_ref_count += 1
+        key = f"{source_type}.{ref_path} -> {target_type or 'unknown'}"
+        self._ref_totals[key] += 1
+        if target_type is None:
+            self._ref_unknown_type[key] += 1
+        else:
+            self._ref_targets[key][target_id] += 1
+            examples = self._ref_examples[key]
+            if len(examples) < 3:
+                examples.append((f"{source_type}/{source_id}", raw_reference, target_id))
+
+    def extract_temporal(self, resource: Dict[str, Any]) -> None:
+        """Accumulate temporal data incrementally."""
+        resource_type = resource.get('resourceType', 'Unknown')
+
+        patient_id = None
+        subject = resource.get('subject', {})
+        if isinstance(subject, dict) and subject.get('reference'):
+            t, i = self.resolve_reference(subject['reference'])
+            if t == 'Patient':
+                patient_id = i
+
+        effective_date = None
+        for date_field in ['effectiveDateTime', 'issued', 'authoredOn', 'recordedDate', 'date']:
+            if date_field in resource:
+                effective_date = parse_fhir_datetime(resource[date_field])
+                if effective_date:
+                    break
+
+        period = resource.get('period', {}) or resource.get('effectivePeriod', {})
+        period_start = None
+        if isinstance(period, dict):
+            period_start = parse_fhir_datetime(period.get('start'))
+
+        effective = effective_date or period_start
+        if not effective:
+            return
+
+        self._temporal_count += 1
+
+        type_slot = self._temporal_by_type[resource_type]
+        if type_slot[0] is None or effective < type_slot[0]:
+            type_slot[0] = effective
+        if type_slot[1] is None or effective > type_slot[1]:
+            type_slot[1] = effective
+        type_slot[2] += 1
+        self._temporal_years[resource_type][effective.year] += 1
+
+        if patient_id:
+            pat_slot = self._temporal_by_patient[patient_id]
+            if pat_slot[0] is None or effective < pat_slot[0]:
+                pat_slot[0] = effective
+            if pat_slot[1] is None or effective > pat_slot[1]:
+                pat_slot[1] = effective
+
+
+    def compute_cardinality_stats(self) -> Dict[str, Dict[str, 'CardinalityStats']]:
+        """Compute cardinality statistics per resource type per anchor."""
+        results: Dict[str, Dict[str, CardinalityStats]] = {}
+
+        for resource_type, patient_counts in self.cardinality_by_patient.items():
+            stats = CardinalityStats()
+            for count in patient_counts.values():
+                stats.add(count)
+            results.setdefault(resource_type, {})['per_patient'] = stats
+
+        for resource_type, encounter_counts in self.cardinality_by_encounter.items():
+            stats = CardinalityStats()
+            for count in encounter_counts.values():
+                stats.add(count)
+            results.setdefault(resource_type, {})['per_encounter'] = stats
+
+        # Encounters per Patient (derived from the encounter→patient mapping)
+        encounters_per_patient = Counter(self.encounter_to_patient.values())
+        if encounters_per_patient:
+            enc_per_pat = CardinalityStats()
+            for count in encounters_per_patient.values():
+                enc_per_pat.add(count)
+            results.setdefault('Encounter', {})['per_patient'] = enc_per_pat
+
+        return results
+
+    def compute_reference_integrity(self) -> Dict[str, Any]:
+        """Compute reference integrity statistics from pre-aggregated counters."""
+        orphan_refs = []
+        refs_by_type = {}
+
+        for key, total in self._ref_totals.items():
+            unknown = self._ref_unknown_type.get(key, 0)
+            valid = 0
+            orphan = 0
+            target_type = key.rsplit(' -> ', 1)[-1] if ' -> ' in key else 'unknown'
+
+            if target_type != 'unknown':
+                known = self.known_ids.get(target_type, set())
+                for tid, count in self._ref_targets.get(key, {}).items():
+                    if tid and tid in known:
+                        valid += count
+                    else:
+                        orphan += count
+
+            if orphan > 0 and len(orphan_refs) < 100:
+                path_part = key.split('.', 1)[1].rsplit(' -> ', 1)[0] if '.' in key else key
+                for src, raw, _ in self._ref_examples.get(key, [])[:3]:
+                    if len(orphan_refs) < 100:
+                        orphan_refs.append({'source': src, 'path': path_part, 'target': raw})
+
+            refs_by_type[key] = {'total': total, 'valid': valid, 'orphan': orphan, 'unknown_type': unknown}
+
+        return {
+            'total_references': self._total_ref_count,
+            'references_by_path': refs_by_type,
+            'orphan_examples': orphan_refs[:20]
+        }
+
+    def compute_temporal_stats(self) -> Dict[str, Any]:
+        """Compute temporal statistics from pre-aggregated per-patient and per-type data."""
+        patient_spans = []
+        for min_d, max_d in self._temporal_by_patient.values():
+            if min_d and max_d:
+                patient_spans.append((max_d - min_d).days)
+
+        type_ranges = {}
+        for rt, slot in self._temporal_by_type.items():
+            min_d, max_d, cnt = slot
+            if min_d and max_d and cnt > 0:
+                type_ranges[rt] = {
+                    'count': cnt,
+                    'earliest': min_d.isoformat(),
+                    'latest': max_d.isoformat()
+                }
+
+        return {
+            'resources_with_dates': self._temporal_count,
+            'patients_with_date_data': len(self._temporal_by_patient),
+            'patient_record_span_days': {
+                'min': min(patient_spans) if patient_spans else 0,
+                'max': max(patient_spans) if patient_spans else 0,
+                'mean': round(statistics.mean(patient_spans), 1) if patient_spans else 0,
+                'median': statistics.median(patient_spans) if patient_spans else 0
+            },
+            'date_ranges_by_type': type_ranges,
+            # Added in output format 2 — older runs lack this key
+            'year_counts_by_type': {
+                rt: dict(sorted(years.items())) for rt, years in sorted(self._temporal_years.items())
+            }
+        }
+
+    def compute_structural_stats(self) -> Dict[str, Any]:
+        """Compute structural depth statistics."""
+        depth_stats = {}
+        for rt, depths in self.max_depths.items():
+            if depths:
+                depth_stats[rt] = {
+                    'min_depth': min(depths),
+                    'max_depth': max(depths),
+                    'mean_depth': round(statistics.mean(depths), 2),
+                    'median_depth': statistics.median(depths)
+                }
+
+        array_stats = {}
+        for key, sizes in self.array_sizes.items():
+            if sizes:
+                array_stats[key] = {
+                    'count': len(sizes),
+                    'min_size': min(sizes),
+                    'max_size': max(sizes),
+                    'mean_size': round(statistics.mean(sizes), 2),
+                    'total_elements': sum(sizes)
+                }
+
+        return {
+            'depth_by_type': depth_stats,
+            'array_statistics': array_stats
+        }
+
+    def compute_data_quality_scores(self) -> Dict[str, Any]:
+        """Compute data quality metrics."""
+        quality_by_type = {}
+
+        all_types = set(self.resources_with_patient_ref.keys()) | set(self.resources_without_patient_ref.keys())
+
+        for rt in all_types:
+            with_patient = self.resources_with_patient_ref.get(rt, 0)
+            without_patient = self.resources_without_patient_ref.get(rt, 0)
+            with_encounter = self.resources_with_encounter_ref.get(rt, 0)
+            total = with_patient + without_patient
+
+            if total > 0:
+                quality_by_type[rt] = {
+                    'total_resources': total,
+                    'with_patient_reference': with_patient,
+                    'without_patient_reference': without_patient,
+                    'patient_linkage_rate': round(with_patient / total, 4),
+                    'with_encounter_reference': with_encounter,
+                    'encounter_linkage_rate': round(with_encounter / total, 4) if total > 0 else 0
+                }
+
+        return quality_by_type
+
+
+# =============================================================================
+# FILE SCANNING
+# =============================================================================
+
+@dataclass
+class ScanResult:
+    """Result of directory scanning."""
+    files: List[Path]
+    total_size_bytes: int
+    scan_errors: List[str]
+
+
+def scan_directory(
+        root_dir: Path,
+        suffixes: tuple = (".json", ".ndjson", ".jsonl"),
+        verbose: bool = True
+) -> ScanResult:
+    """Recursively scan a directory (all subfolders) for JSON/NDJSON files."""
+    files = []
+    total_size = 0
+    errors = []
+
+    root_dir = Path(root_dir)
+
+    if not root_dir.is_dir():
+        errors.append(f"Input directory does not exist or is not a directory: {root_dir}")
+        return ScanResult(files=[], total_size_bytes=0, scan_errors=errors)
+
+    if verbose:
+        print(f"Scanning directory: {root_dir}")
+
+    suffixes = tuple(x.lower() for x in suffixes)
+    for dirpath, _, filenames in os.walk(root_dir, onerror=lambda e: errors.append(f"Cannot access {e.filename}: {e}")):
+        for name in filenames:
+            # "._name.json" are macOS metadata files, not FHIR
+            if name.lower().endswith(suffixes) and not name.startswith('._'):
+                file_path = Path(dirpath) / name
+                try:
+                    total_size += file_path.stat().st_size
+                    files.append(file_path)
+                except OSError as e:
+                    errors.append(f"Cannot access {file_path}: {e}")
+
+    files.sort()
+
+    if verbose:
+        size_mb = total_size / (1024 * 1024)
+        print(f"Found {len(files)} files ({size_mb:.2f} MB)")
+
+    return ScanResult(files=files, total_size_bytes=total_size, scan_errors=errors)
+
+
+# =============================================================================
+# BUNDLE PARSING
+# =============================================================================
+
+def extract_resources_from_bundle(
+        bundle: Dict[str, Any],
+        urn_map: Optional[Dict[str, Tuple[str, str]]] = None
+) -> Generator[Dict[str, Any], None, None]:
+    """Extract resources from a FHIR Bundle. Fills `urn_map` (fullUrl → (type, id)) for this bundle."""
+    resource_type = bundle.get('resourceType')
+
+    if resource_type == 'Bundle':
+        entries = bundle.get('entry', [])
+        if urn_map is not None:
+            urn_map.clear()
+            for entry in entries:
+                res = entry.get('resource')
+                if entry.get('fullUrl') and isinstance(res, dict) and res.get('id'):
+                    urn_map[entry['fullUrl']] = (res.get('resourceType'), str(res['id']))
+        for entry in entries:
+            resource = entry.get('resource')
+            if resource and isinstance(resource, dict):
+                yield resource
+    elif resource_type:
+        yield bundle
+
+
+def extract_resources_from_file(
+        file_path: Path,
+        errors: List[str],
+        urn_map: Optional[Dict[str, Tuple[str, str]]] = None
+) -> Generator[Dict, None, None]:
+    """Stream resources one by one from a JSON/NDJSON file."""
+    try:
+        for obj in safe_json_load(file_path, errors):
+            if not isinstance(obj, dict):
+                errors.append(f"Non-object JSON element in {file_path}")
+                continue
+            yield from extract_resources_from_bundle(obj, urn_map)
+    except Exception as e:
+        errors.append(f"Error processing {file_path}: {e}")
+
+
+# =============================================================================
+# PATH TRAVERSAL
+# =============================================================================
+
+def traverse_resource(
+        resource: Dict[str, Any],
+        inline_extensions: bool = True,
+        max_depth: int = 50
+) -> Generator[Tuple[str, Any, str, bool, int], None, None]:
+    """Recursively traverse a FHIR resource, yielding (path, value, type, is_first, depth)."""
+    resource_type = resource.get('resourceType', 'Unknown')
+    # Tracks every path seen in this resource; used to emit is_first=True only on first encounter
+    paths_in_resource: Set[str] = set()
+
+    def _traverse(obj: Any, current_path: str, depth: int = 0):
+        if depth > max_depth:
+            return
+
+        if isinstance(obj, dict):
+            # Yield the object itself before recursing into its fields
+            yield (current_path, obj, 'object', current_path not in paths_in_resource, depth)
+            paths_in_resource.add(current_path)
+
+            if inline_extensions and 'extension' in obj:
+                # Flatten extensions: use their URL as part of the path instead of a numeric index
+                for ext in obj.get('extension', []):
+                    if isinstance(ext, dict) and 'url' in ext:
+                        url = ext['url']
+                        ext_path = f"{current_path}.extension[{url}]" if current_path else f"extension[{url}]"
+
+                        for key, value in ext.items():
+                            if key != 'url':
+                                child_path = f"{ext_path}.{key}"
+                                yield from _traverse(value, child_path, depth + 1)
+
+            for key, value in obj.items():
+                if inline_extensions and key == 'extension':
+                    continue  # already handled above
+                child_path = f"{current_path}.{key}" if current_path else key
+                yield from _traverse(value, child_path, depth + 1)
+
+        elif isinstance(obj, list):
+            # All array items share the same path with a '[]' suffix (type-agnostic)
+            array_path = current_path + '[]'
+            yield (array_path, obj, 'array', array_path not in paths_in_resource, depth)
+            paths_in_resource.add(array_path)
+
+            for item in obj:
+                yield from _traverse(item, array_path, depth + 1)
+
+        else:
+            # Scalar value (string, number, boolean, null)
+            is_first = current_path not in paths_in_resource  # True only on first occurrence in this resource
+            paths_in_resource.add(current_path)
+            yield (current_path, obj, get_python_type(obj), is_first, depth)
+
+    yield from _traverse(resource, resource_type)
+
+
+# =============================================================================
+# AGGREGATOR
+# =============================================================================
+
+class Aggregator:
+    """Main aggregation engine."""
+
+    def __init__(self, config: ProfilerConfig):
+        self.config = config
+        # {resource_type: {group: statistics}}; unsplit types have the single group ''
+        self.groups: Dict[str, Dict[str, ResourceTypeStatistics]] = {}
+        self.multi_group: Counter = Counter()   # resources with several groups (counted in the first)
+        self.files_processed: int = 0
+        self.total_resources: int = 0
+        self.errors: List[str] = []
+        self.relational = RelationalAnalyzer()
+        # known_ids (inside relational) is reused for dedup — no separate seen_resource_ids needed
+        self.dedup_counts: Counter = Counter()  # per-type count of skipped duplicates
+
+    def _new_stats(self, resource_type: str) -> ResourceTypeStatistics:
+        return ResourceTypeStatistics(
+            resource_type=resource_type,
+            hll_precision=self.config.hll_precision,
+            hll_threshold=self.config.hll_threshold,
+            top_n=self.config.top_values_limit,
+            max_value_length=self.config.max_value_length
+        )
+
+    def _group_of(self, resource: Dict[str, Any], resource_type: str) -> str:
+        """Group the resource is counted in; '' for resource types that are not split."""
+        split_field = SPLIT_FIELDS.get(resource_type) if self.config.split else None
+        if not split_field:
+            return ''
+        keys = group_keys(resource, split_field)
+        if len(keys) > 1:
+            self.multi_group[resource_type] += 1
+        return assign_group(self.groups.get(resource_type, {}), keys[0], self.config.max_groups)
+
+    def _get_or_create_resource_type(self, resource_type: str, group: str = '') -> ResourceTypeStatistics:
+        type_groups = self.groups.setdefault(resource_type, {})
+        if group not in type_groups:
+            type_groups[group] = self._new_stats(resource_type)
+        return type_groups[group]
+
+    def process_resource(self, resource: Dict[str, Any]) -> None:
+        resource_type = resource.get('resourceType')
+
+        if not resource_type:
+            self.errors.append("Resource without resourceType encountered")
+            return
+
+        if resource_type in self.config.skip_types:
+            return
+
+        # Register every ID for the reference integrity check. Only shared types (config.dedup_types) are
+        # skipped when seen again; other types are counted as found, because IDs are often reused between files.
+        resource_id = resource.get('id')
+        if resource_id:
+            rt_ids = self.relational.known_ids[resource_type]
+            if resource_id in rt_ids and resource_type in self.config.dedup_types:
+                self.dedup_counts[resource_type] += 1
+                return
+            rt_ids.add(resource_id)
+
+        group = self._group_of(resource, resource_type)
+        type_stats = self._get_or_create_resource_type(resource_type, group)
+        type_stats.increment_resource_count()
+        # Relational counters (cardinality, linkage) per type and, for split types, per group as well
+        rel_keys = (resource_type,) if not group else (resource_type, f"{resource_type}{GROUP_SEP}{group}")
+        self.total_resources += 1
+
+        paths_seen_in_resource: Set[str] = set()
+        analyze = self.config.analyze_relations
+        # Relational state accumulated across the single traversal pass
+        local_patient_ref: Optional[str] = None
+        local_encounter_ref: Optional[str] = None
+        resource_max_depth: int = 0
+        # prefix length used to strip "ResourceType." from paths for reference_path storage
+        rt_prefix_len = len(resource_type) + 1
+
+        for path, value, python_type, is_first_in_resource, depth in traverse_resource(
+                resource,
+                inline_extensions=self.config.inline_extensions
+        ):
+            # ── field-level profiling ─────────────────────────────────────────
+            field_stats = type_stats.get_or_create_field(path)
+
+            if is_first_in_resource and path not in paths_seen_in_resource:
+                field_stats.mark_resource_presence()
+                paths_seen_in_resource.add(path)
+
+            # Extract the bare field name from the path for FHIR type detection.
+            # e.g. 'Patient.name[]' → 'name', 'Observation.valueQuantity' → 'valueQuantity'
+            field_name = path.rstrip('[]').rsplit('.', 1)[-1]
+
+            if python_type not in ('array', 'object'):
+                field_stats.add_value(value, python_type)
+                # Layer 1 (string narrowing) gives specific primitive types for scalars
+                field_stats.fhir_types[detect_fhir_type(value, field_name)] += 1
+            elif python_type == 'object':
+                field_stats.types_seen[python_type] += 1
+                field_stats.value_count += 1
+                # Layer 1 (dict fingerprinting) + Layer 2 (field name) for complex types
+                field_stats.fhir_types[detect_fhir_type(value, field_name)] += 1
+            else:  # array
+                # The list itself is not a value: value_count counts items only (format 3; format 1-2 counted it too)
+                field_stats.types_seen[python_type] += 1
+
+            if not analyze:
+                continue
+
+            # ── relational analysis (merged — no second/third traversal) ──────
+            resource_max_depth = max(resource_max_depth, depth)
+
+            if python_type == 'array':
+                self.relational.array_sizes[f"{resource_type}_arrays"].append(len(value))
+
+            elif python_type == 'object' and 'reference' in value:
+                ref_value = value['reference']
+                target_type, target_id = self.relational.resolve_reference(ref_value)
+                # Strip the leading "ResourceType." prefix to match the original path format
+                ref_path = path[rt_prefix_len:] if len(path) > rt_prefix_len else ''
+                self.relational.add_reference(
+                    source_type=resource_type,
+                    source_id=resource_id or 'unknown',
+                    ref_path=ref_path,
+                    target_type=target_type,
+                    target_id=target_id,
+                    raw_reference=ref_value
+                )
+                if target_type == 'Patient':
+                    local_patient_ref = target_id
+                elif target_type == 'Encounter':
+                    local_encounter_ref = target_id
+
+        # ── post-traversal relational updates ─────────────────────────────────
+        if analyze:
+            self.relational.extract_temporal(resource)
+            self.relational.max_depths[resource_type].append(resource_max_depth)
+
+            for key in rel_keys:
+                if local_patient_ref:
+                    self.relational.cardinality_by_patient[key][local_patient_ref] += 1
+                    self.relational.resources_with_patient_ref[key] += 1
+                else:
+                    self.relational.resources_without_patient_ref[key] += 1
+
+                if local_encounter_ref:
+                    self.relational.cardinality_by_encounter[key][local_encounter_ref] += 1
+                    self.relational.resources_with_encounter_ref[key] += 1
+
+            if resource_type == 'Encounter' and local_patient_ref and resource_id:
+                self.relational.encounter_to_patient[resource_id] = local_patient_ref
+
+    def process_resources(self, resources: List[Dict[str, Any]]) -> None:
+        for resource in resources:
+            try:
+                self.process_resource(resource)
+            except Exception as e:
+                resource_type = resource.get('resourceType', 'Unknown')
+                resource_id = resource.get('id', 'no-id')
+                self.errors.append(f"Error processing {resource_type}/{resource_id}: {e}")
+
+    def mark_file_processed(self) -> None:
+        self.files_processed += 1
+
+    def get_summary(self) -> Dict[str, Any]:
+        return {
+            'files_processed': self.files_processed,
+            'total_resources': self.total_resources,
+            'resource_types': list(self.groups.keys()),
+            'resource_type_counts': {
+                rt: sum(s.total_resources for s in groups.values())
+                for rt, groups in self.groups.items()
+            },
+            'error_count': len(self.errors)
+        }
+
+    def get_results(self) -> Dict[str, ResourceTypeStatistics]:
+        """Statistics per resource type: the merge of its groups."""
+        results = {}
+        for rt, groups in self.groups.items():
+            if list(groups) == ['']:
+                results[rt] = groups['']
+            else:
+                merged = self._new_stats(rt)
+                for stats in groups.values():
+                    merge_type_stats(merged, stats)
+                results[rt] = merged
+        return results
+
+    def get_group_results(self) -> Dict[str, Dict[str, ResourceTypeStatistics]]:
+        """Statistics per group, only for resource types that are split."""
+        return {rt: groups for rt, groups in self.groups.items() if list(groups) != ['']}
+
+    def get_relational_results(self) -> RelationalAnalyzer:
+        return self.relational
+
+    def get_dedup_counts(self) -> Counter:
+        return self.dedup_counts
+
+
+# =============================================================================
+# EXPORT FUNCTIONS
+# =============================================================================
+
+def format_top_values(top_values: List[tuple], as_json: bool = True) -> str:
+    if not top_values:
+        return ""
+    if as_json:
+        return json.dumps(top_values, ensure_ascii=False)
+    return "; ".join(f"{val} ({count})" for val, count in top_values)
+
+
+def export_resource_type_csv(
+        resource_type: str,
+        stats: ResourceTypeStatistics,
+        output_dir: Path,
+        groups: Optional[Dict[str, ResourceTypeStatistics]] = None
+) -> Path:
+    """Export field statistics for a single resource type, or with `groups` one row block per group
+    into <Type>_by_<field>_fields.csv (first column: group)."""
+    safe_name = "".join(c if c.isalnum() or c in '-_' else '_' for c in resource_type)
+    suffix = f"_by_{SPLIT_FIELDS[resource_type]}" if groups else ""
+    output_file = output_dir / f"{safe_name}{suffix}_fields.csv"
+    blocks = sorted(groups.items()) if groups else [(None, stats)]
+
+    columns = ([] if not groups else ['group']) + [
+        'field_path', 'resources_with_field', 'total_resources',
+        'presence_rate', 'missing_rate', 'value_count', 'unique_count',
+        'unique_count_approximate', 'detected_python_types', 'detected_fhir_type',
+        'type_inconsistency',
+        'numeric_count', 'numeric_min', 'numeric_max', 'numeric_mean', 'numeric_stdev',
+        'top_values'
+    ]
+
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+
+        for group, stats in blocks:
+            for path, field_stats in sorted(stats.field_stats.items()):
+                presence_rate = field_stats.resource_count / stats.total_resources if stats.total_resources > 0 else 0
+
+                writer.writerow({
+                    **({} if group is None else {'group': group}),
+                    'field_path': path,
+                    'resources_with_field': field_stats.resource_count,
+                    'total_resources': stats.total_resources,
+                    'presence_rate': f"{presence_rate:.2f}",
+                    'missing_rate': f"{1 - presence_rate:.2f}",
+                    'value_count': field_stats.value_count,
+                    'unique_count': field_stats.unique_count,
+                    'unique_count_approximate': field_stats.unique_count_approximate,
+                    'detected_python_types': ', '.join(field_stats.detected_python_types),
+                    'detected_fhir_type': field_stats.detected_fhir_type,
+                    'type_inconsistency': field_stats.has_type_inconsistency,
+                    'numeric_count': field_stats.numeric_count or '',
+                    'numeric_min': field_stats.numeric_min if field_stats.numeric_min is not None else '',
+                    'numeric_max': field_stats.numeric_max if field_stats.numeric_max is not None else '',
+                    'numeric_mean': field_stats.numeric_mean if field_stats.numeric_mean is not None else '',
+                    'numeric_stdev': field_stats.numeric_stdev if field_stats.numeric_stdev is not None else '',
+                    'top_values': format_top_values(field_stats.top_values)
+                })
+
+    return output_file
+
+
+def export_cardinality_csv(
+        cardinality_stats: Dict[str, Dict[str, CardinalityStats]],
+        relational: 'RelationalAnalyzer',
+        output_dir: Path,
+        by_group: bool = False
+) -> Path:
+    """Export cardinality analysis with patient/encounter coverage (per type, or per group with by_group)."""
+    output_file = output_dir / ("03_cardinality_by_group.csv" if by_group else "03_cardinality.csv")
+
+    # Pre-compute totals for coverage ratios
+    total_patients = len(relational.known_ids.get('Patient', set()))
+    total_encounters = len(relational.known_ids.get('Encounter', set()))
+
+    columns = [
+        'resource_type', *(['group'] if by_group else []), 'anchor_type',
+        # How many unique anchors (patients or encounters) have ≥1 resource of this type
+        'anchors_with_resource', 'total_anchors_in_dataset', 'coverage_rate',
+        # Distribution of resource counts per anchor
+        'total_resources', 'min', 'max', 'mean', 'median', 'std_dev',
+        'p25', 'p75', 'p90', 'p99'
+    ]
+
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+
+        for key in sorted(k for k in cardinality_stats if (GROUP_SEP in k) == by_group):
+            resource_type, _, group = key.partition(GROUP_SEP)
+            anchors = cardinality_stats[key]
+            for anchor_type in sorted(anchors.keys()):
+                stats = anchors[anchor_type]
+
+                # anchors_with_resource = unique patients/encounters that have ≥1 resource
+                # stats.total_anchors counts only those with at least one (built from cardinality dicts)
+                anchors_with_resource = stats.total_anchors
+                if anchor_type == 'per_patient':
+                    total_in_dataset = total_patients
+                elif anchor_type == 'per_encounter':
+                    total_in_dataset = total_encounters
+                else:
+                    total_in_dataset = anchors_with_resource  # unknown anchor type
+
+                coverage_rate = (
+                    anchors_with_resource / total_in_dataset
+                    if total_in_dataset > 0 else 0.0
+                )
+
+                # Compute all percentiles in one sort pass
+                pcts = stats.percentiles(25, 75, 90, 99)
+
+                # Build the row explicitly — avoids any key collision from to_dict()
+                # coverage_rate is formatted as a fixed 4-decimal string so spreadsheets
+                # with European locale don't misread e.g. "0.377" as the integer 377
+                writer.writerow({
+                    'resource_type': resource_type,
+                    **({'group': group} if by_group else {}),
+                    'anchor_type': anchor_type,
+                    'anchors_with_resource': anchors_with_resource,
+                    'total_anchors_in_dataset': total_in_dataset,
+                    'coverage_rate': f"{coverage_rate:.4f}",
+                    'total_resources': stats.total_resources,
+                    'min': stats.min_count,
+                    'max': stats.max_count,
+                    'mean': round(stats.mean_count, 2),
+                    'median': stats.median_count,
+                    'std_dev': round(stats.std_dev, 2),
+                    'p25': pcts[25],
+                    'p75': pcts[75],
+                    'p90': pcts[90],
+                    'p99': pcts[99],
+                })
+
+    return output_file
+
+
+def export_data_quality_csv(
+        quality_stats: Dict[str, Any],
+        output_dir: Path,
+        by_group: bool = False
+) -> Path:
+    """Export data quality metrics (per type, or per group with by_group)."""
+    output_file = output_dir / ("04_data_quality_by_group.csv" if by_group else "04_data_quality.csv")
+
+    columns = [
+        'resource_type', *(['group'] if by_group else []), 'total_resources', 'with_patient_reference',
+        'without_patient_reference', 'patient_linkage_rate',
+        'with_encounter_reference', 'encounter_linkage_rate'
+    ]
+
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+
+        for key in sorted(k for k in quality_stats if (GROUP_SEP in k) == by_group):
+            resource_type, _, group = key.partition(GROUP_SEP)
+            row = {'resource_type': resource_type, **({'group': group} if by_group else {})}
+            row.update(quality_stats[key])
+            writer.writerow(row)
+
+    return output_file
+
+
+def _format_as_text(data: Any, indent: int = 0) -> str:
+    """Recursively format a dict or list as readable plain text."""
+    prefix = "  " * indent
+    lines = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, (dict, list)):
+                lines.append(f"{prefix}{key}:")
+                lines.append(_format_as_text(value, indent + 1))
+            else:
+                lines.append(f"{prefix}{key}: {value}")
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, (dict, list)):
+                lines.append(_format_as_text(item, indent))
+                lines.append("")  # blank line between list entries
+            else:
+                lines.append(f"{prefix}- {item}")
+    else:
+        lines.append(f"{prefix}{data}")
+    return "\n".join(lines)
+
+
+def _export_analysis_txt(title: str, data: Any, filename: str, output_dir: Path) -> Path:
+    """Write a titled plain-text analysis report."""
+    output_file = output_dir / filename
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(f"{title}\n")
+        f.write("=" * 40 + "\n\n")
+        f.write(_format_as_text(data))
+        f.write("\n")
+    return output_file
+
+
+def export_summary_csv(
+        results: Dict[str, ResourceTypeStatistics],
+        output_dir: Path,
+        relational: 'RelationalAnalyzer',
+        dedup_counts: Counter,
+        unique_patients: int = 0
+) -> Path:
+    """Export summary of all resource types."""
+    output_file = output_dir / "01_summary.csv"
+
+    columns = [
+        'resource_type', 'total_resources', 'deduplicated_resources',
+        'patient_linked_resources', 'unlinked_resources', 'patient_linkage_rate',
+        'avg_resources_per_patient',
+        'total_fields', 'fields_always_present', 'fields_sometimes_present',
+        'fields_with_type_inconsistency'
+    ]
+
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+
+        for resource_type, stats in sorted(results.items()):
+            always_present = sum(
+                1 for fs in stats.field_stats.values()
+                if fs.resource_count == stats.total_resources and stats.total_resources > 0
+            )
+            sometimes_present = sum(
+                1 for fs in stats.field_stats.values()
+                if 0 < fs.resource_count < stats.total_resources
+            )
+            type_inconsistent = sum(
+                1 for fs in stats.field_stats.values()
+                if fs.has_type_inconsistency
+            )
+
+            # Patient resources ARE the anchor — treat them as fully linked
+            if resource_type == 'Patient':
+                linked = stats.total_resources
+            else:
+                linked = relational.resources_with_patient_ref.get(resource_type, 0)
+            unlinked = stats.total_resources - linked
+            linkage_rate = f"{linked / stats.total_resources:.4f}" if stats.total_resources > 0 else ''
+            avg = round(linked / unique_patients, 2) if unique_patients > 0 else ''
+
+            writer.writerow({
+                'resource_type': resource_type,
+                'total_resources': stats.total_resources,
+                'deduplicated_resources': dedup_counts.get(resource_type, 0) or '',
+                'patient_linked_resources': linked,
+                'unlinked_resources': unlinked,
+                'patient_linkage_rate': linkage_rate,
+                'avg_resources_per_patient': avg,
+                'total_fields': len(stats.field_stats),
+                'fields_always_present': always_present,
+                'fields_sometimes_present': sometimes_present,
+                'fields_with_type_inconsistency': type_inconsistent
+            })
+
+    return output_file
+
+
+def export_summary_details_csv(
+        results: Dict[str, ResourceTypeStatistics],
+        output_dir: Path
+) -> Path:
+    """
+    Export a detailed field-level breakdown for the summary categories.
+
+    One row per field per resource type, with its presence category and
+    type inconsistency flag — so the user can filter and follow up on
+    always-present, sometimes-present, or type-inconsistent fields by name.
+    """
+    output_file = output_dir / "02_summary_details.csv"
+
+    columns = [
+        'resource_type',
+        'field_path',
+        'presence_category',    # always_present / sometimes_present / never_present
+        'presence_rate',        # fraction of resources that contain this field
+        'resources_with_field',
+        'total_resources',
+        'has_type_inconsistency',
+        'detected_python_types',       # comma-separated list of observed types
+    ]
+
+    # Category order for sorting within each resource type
+    category_order = {'always_present': 0, 'sometimes_present': 1, 'never_present': 2}
+
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+
+        for resource_type, stats in sorted(results.items()):
+            rows = []
+            for path, fs in stats.field_stats.items():
+                # Determine presence category
+                if stats.total_resources > 0 and fs.resource_count == stats.total_resources:
+                    category = 'always_present'
+                elif fs.resource_count > 0:
+                    category = 'sometimes_present'
+                else:
+                    category = 'never_present'
+
+                presence_rate = (
+                    fs.resource_count / stats.total_resources
+                    if stats.total_resources > 0 else 0.0
+                )
+
+                rows.append({
+                    'resource_type': resource_type,
+                    'field_path': path,
+                    'presence_category': category,
+                    'presence_rate': f"{presence_rate:.4f}",
+                    'resources_with_field': fs.resource_count,
+                    'total_resources': stats.total_resources,
+                    'has_type_inconsistency': fs.has_type_inconsistency,
+                    'detected_python_types': ', '.join(fs.detected_python_types),
+                })
+
+            # Sort: category order first, then field path alphabetically
+            rows.sort(key=lambda r: (category_order[r['presence_category']], r['field_path']))
+            writer.writerows(rows)
+
+    return output_file
+
+
+def export_all_results(
+        results: Dict[str, ResourceTypeStatistics],
+        relational: RelationalAnalyzer,
+        dedup_counts: Counter,
+        output_dir: Path,
+        verbose: bool = True,
+        group_results: Optional[Dict[str, Dict[str, ResourceTypeStatistics]]] = None
+) -> Dict[str, Path]:
+    """Export all analysis results."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_files = {}
+
+    # Field-level profiles
+    if verbose:
+        print("\nExporting field profiles...")
+    for resource_type, stats in results.items():
+        output_file = export_resource_type_csv(resource_type, stats, output_dir)
+        output_files[resource_type] = output_file
+        if verbose:
+            print(f"  {resource_type}: {len(stats.field_stats)} fields")
+        if group_results and resource_type in group_results:
+            output_files[f"{resource_type}_by_group"] = export_resource_type_csv(
+                resource_type, stats, output_dir, groups=group_results[resource_type])
+            if verbose:
+                print(f"    {len(group_results[resource_type])} groups by {SPLIT_FIELDS[resource_type]}")
+
+    # Summary (counts) + detailed breakdown (field names per category)
+    unique_patients = len(relational.known_ids.get('Patient', set()))
+    output_files['_summary'] = export_summary_csv(results, output_dir, relational, dedup_counts, unique_patients)
+    output_files['_summary_details'] = export_summary_details_csv(results, output_dir)
+    if verbose:
+        total_fields = sum(len(s.field_stats) for s in results.values())
+        print(f"  Summary details: {total_fields} fields across {len(results)} resource types")
+
+    # Cardinality analysis
+    if verbose:
+        print("\nExporting relational analysis...")
+
+    cardinality = relational.compute_cardinality_stats()
+    output_files['_cardinality'] = export_cardinality_csv(cardinality, relational, output_dir)
+    if group_results:
+        output_files['_cardinality_by_group'] = export_cardinality_csv(cardinality, relational, output_dir, by_group=True)
+    if verbose:
+        print(f"  Cardinality: {sum(GROUP_SEP not in k for k in cardinality)} resource types")
+
+    # Data quality
+    quality = relational.compute_data_quality_scores()
+    output_files['_data_quality'] = export_data_quality_csv(quality, output_dir)
+    if group_results:
+        output_files['_data_quality_by_group'] = export_data_quality_csv(quality, output_dir, by_group=True)
+    if verbose:
+        print(f"  Data quality: {sum(GROUP_SEP not in k for k in quality)} resource types")
+
+    # Reference integrity
+    integrity = relational.compute_reference_integrity()
+    output_files['_reference_integrity'] = _export_analysis_txt(
+        "REFERENCE INTEGRITY ANALYSIS", integrity, "05_reference_integrity.txt", output_dir
+    )
+    if verbose:
+        print(f"  Reference integrity: {integrity['total_references']} references analysed")
+
+    # Temporal analysis
+    temporal = relational.compute_temporal_stats()
+    output_files['_temporal'] = _export_analysis_txt(
+        "TEMPORAL ANALYSIS", temporal, "06_temporal_analysis.txt", output_dir
+    )
+    if verbose:
+        print(f"  Temporal: {temporal['resources_with_dates']} dated resources")
+
+    # Structural analysis
+    structural = relational.compute_structural_stats()
+    output_files['_structural'] = _export_analysis_txt(
+        "STRUCTURAL DEPTH ANALYSIS", structural, "07_structural_analysis.txt", output_dir
+    )
+    if verbose:
+        print(f"  Structural depth: {len(structural['depth_by_type'])} resource types")
+
+    return output_files
+
+
+def _format_elapsed(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m > 0:
+        return f"{m}m {s:02d}s"
+    return f"{seconds:.1f}s"
+
+
+def write_run_summary(
+        output_dir: Path,
+        run_name: str,
+        run_start: datetime,
+        elapsed: float,
+        config: ProfilerConfig,
+        scan_result: ScanResult,
+        summary: dict,
+        relational: RelationalAnalyzer,
+        dedup_counts: Counter,
+        peak_mb: Optional[float],
+        all_errors: List[str],
+        output_files: dict,
+        group_results: Optional[Dict[str, Dict[str, ResourceTypeStatistics]]] = None,
+        multi_group: Optional[Counter] = None,
+) -> Path:
+    """Write a human-readable run summary to 00_run_summary.txt."""
+    output_file = output_dir / "00_run_summary.txt"
+    run_end = run_start + timedelta(seconds=elapsed)
+    unique_patients = len(relational.known_ids.get('Patient', set()))
+    unique_encounters = len(relational.known_ids.get('Encounter', set()))
+
+    lines: List[str] = []
+
+    def _section(title: str) -> None:
+        lines.append("")
+        lines.append(title)
+        lines.append("-" * len(title))
+
+    lines.append("RUN SUMMARY — FHIRScan File Profiler")
+    lines.append("=" * 40)
+    lines.append(f"Run name:  {run_name}")
+    lines.append(f"Version:   {FHIRSCAN_VERSION} (output format {OUTPUT_FORMAT})")
+    lines.append(f"Started:   {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Finished:  {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Elapsed:   {_format_elapsed(elapsed)}")
+    lines.append(f"Peak RAM:  {_format_ram(peak_mb)}")
+
+    _section("INPUT")
+    size_mb = scan_result.total_size_bytes / (1024 * 1024)
+    lines.append(f"Directory:  {config.input_dir}")
+    lines.append(f"Files:      {len(scan_result.files):,} ({size_mb:.2f} MB)")
+
+    _section("CONFIGURATION")
+    lines.append(f"Top-N values:        {config.top_values_limit}")
+    lines.append(f"Relational analysis: {'enabled' if config.analyze_relations else 'disabled'}")
+    lines.append(f"Skip types:          {', '.join(sorted(config.skip_types)) or '(none)'}")
+    lines.append(f"Dedup types:         {', '.join(sorted(config.dedup_types)) or '(none)'}")
+    lines.append(f"Inline extensions:   {'enabled' if config.inline_extensions else 'disabled'}")
+    lines.append(f"Grouping:            {f'enabled (max {config.max_groups} groups per type)' if config.split else 'disabled'}")
+    lines.append(f"HLL precision:       {config.hll_precision}")
+
+    _section("RESULTS")
+    lines.append(f"Files processed:    {summary['files_processed']:,}")
+    lines.append(f"Total resources:    {summary['total_resources']:,}")
+    lines.append(f"Resource types:     {len(summary['resource_types'])}")
+    lines.append(f"Unique patients:    {unique_patients:,}")
+    lines.append(f"Unique encounters:  {unique_encounters:,}")
+
+    type_counts = sorted(summary['resource_type_counts'].items(), key=lambda x: -x[1])
+    if type_counts:
+        lines.append("")
+        lines.append("Resource type counts:")
+        max_name = max(len(rt) for rt, _ in type_counts)
+        for rt, count in type_counts:
+            lines.append(f"  {rt:<{max_name}}  {count:>12,}")
+
+    if dedup_counts:
+        lines.append("")
+        lines.append("Deduplications (skipped as duplicate):")
+        for rt, count in sorted(dedup_counts.items()):
+            lines.append(f"  {rt}: {count:,}")
+
+    if group_results:
+        _section("GROUPS")
+        for rt in sorted(group_results):
+            lines.append(f"{rt} by {SPLIT_FIELDS[rt]}:")
+            for group, stats in sorted(group_results[rt].items(), key=lambda x: -x[1].total_resources):
+                lines.append(f"  {stats.total_resources:>12,}  {group}")
+            if multi_group and multi_group.get(rt):
+                lines.append(f"  ({multi_group[rt]:,} resources with several groups, counted in the first)")
+
+    _section("ERRORS")
+    lines.append(f"Total: {len(all_errors)}")
+    if all_errors:
+        lines.append("")
+        for err in all_errors[:20]:
+            lines.append(f"  {err}")
+        if len(all_errors) > 20:
+            lines.append(f"  ... and {len(all_errors) - 20} more (see 99_errors.txt)")
+
+    _section("OUTPUT FILES")
+    for _, path in sorted(output_files.items()):
+        lines.append(f"  {path.name}")
+
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+        f.write("\n")
+
+    return output_file
+
+
+# =============================================================================
+# MAIN PROFILER
+# =============================================================================
+
+def run_profiler(config: ProfilerConfig) -> dict:
+    """Run the FHIR dataset profiler with relational analysis."""
+    start_time = time.time()
+    run_start = datetime.now()
+    verbose = config.verbose
+
+    folder_name = config.run_name if config.run_name else run_start.strftime("%Y%m%d_%H_%M")
+    timestamped_output_dir = config.output_dir / folder_name
+
+    if not _check_output_writable(config.output_dir):
+        return {'error': 'Output directory not writable'}
+
+    timestamped_output_dir.mkdir(parents=True, exist_ok=True)
+
+    if verbose:
+        print("=" * 70)
+        print("FHIR Dataset Profiler - Enhanced with Relational Analysis")
+        print("=" * 70)
+
+    # Scan for files
+    scan_result = scan_directory(config.input_dir, suffixes=config.file_suffixes, verbose=verbose)
+
+    if not scan_result.files:
+        for err in scan_result.scan_errors:
+            print(f"Error: {err}")
+        print(f"No {'/'.join(config.file_suffixes)} files found in {config.input_dir}")
+        return {'error': 'No files found'}
+
+    # Initialize aggregator
+    aggregator = Aggregator(config)
+
+    # Process files
+    if verbose:
+        print(f"\nProcessing {len(scan_result.files)} files...")
+
+    extraction_errors = []
+    total_files = len(scan_result.files)
+
+    for idx, file_path in enumerate(scan_result.files, 1):
+        try:
+            for resource in extract_resources_from_file(file_path, extraction_errors, aggregator.relational.urn_map):
+                aggregator.process_resource(resource)
+            aggregator.mark_file_processed()
+
+            if verbose and (idx % 50 == 0 or idx == total_files):
+                summary = aggregator.get_summary()
+                print(f"  [{idx}/{total_files}] Resources: {summary['total_resources']:,}")
+
+        except Exception as e:
+            extraction_errors.append(f"Fatal error processing {file_path}: {e}")
+
+    peak_mb = _get_peak_ram_mb()
+
+    # Get results
+    results = aggregator.get_results()
+    relational = aggregator.get_relational_results()
+    dedup_counts = aggregator.get_dedup_counts()
+    summary = aggregator.get_summary()
+
+    if verbose:
+        print(f"\n" + "-" * 50)
+        print("Processing Complete!")
+        print(f"  Files processed:  {summary['files_processed']:,}")
+        print(f"  Total resources:  {summary['total_resources']:,}")
+        print(f"  Resource types:   {len(summary['resource_types'])}")
+        print(f"  Unique patients:  {len(relational.known_ids.get('Patient', set())):,}")
+        print(f"  Unique encounters:{len(relational.known_ids.get('Encounter', set())):,}")
+        print(f"  Peak RAM:           {_format_ram(peak_mb)}")
+        print("-" * 50)
+
+    # Export all results
+    if verbose:
+        print(f"\nExporting results to: {timestamped_output_dir}")
+
+    group_results = aggregator.get_group_results()
+    output_files = export_all_results(results, relational, dedup_counts, timestamped_output_dir, verbose,
+                                      group_results=group_results)
+
+    # Write errors
+    all_errors = aggregator.errors + extraction_errors + scan_result.scan_errors
+    if all_errors:
+        error_file = timestamped_output_dir / "99_errors.txt"
+        with open(error_file, 'w', encoding='utf-8') as f:
+            for error in all_errors:
+                f.write(f"{error}\n")
+        output_files['_errors'] = error_file
+        if verbose:
+            print(f"\n{len(all_errors)} errors/warnings, e.g. invalid files, written to: {error_file}")
+
+    elapsed = time.time() - start_time
+
+    summary_file = write_run_summary(
+        output_dir=timestamped_output_dir,
+        run_name=folder_name,
+        run_start=run_start,
+        elapsed=elapsed,
+        config=config,
+        scan_result=scan_result,
+        summary=summary,
+        relational=relational,
+        dedup_counts=dedup_counts,
+        peak_mb=peak_mb,
+        all_errors=all_errors,
+        output_files=output_files,
+        group_results=group_results,
+        multi_group=aggregator.multi_group,
+    )
+    output_files['_run_summary'] = summary_file
+
+    if verbose:
+        print(f"\nDone! Elapsed: {elapsed:.2f}s | Peak RAM: {_format_ram(peak_mb)}")
+        print(f"\nOutput files:")
+        for name, path in sorted(output_files.items()):
+            print(f"  {path.name}")
+
+    return {
+        'files_processed': summary['files_processed'],
+        'total_resources': summary['total_resources'],
+        'resource_types': summary['resource_types'],
+        'unique_patients': len(relational.known_ids.get('Patient', set())),
+        'unique_encounters': len(relational.known_ids.get('Encounter', set())),
+        'peak_ram_mb': round(peak_mb, 1) if peak_mb is not None else None,
+        'output_files': output_files,
+        'elapsed_seconds': elapsed,
+        'error_count': len(all_errors)
+    }
+
+
+# =============================================================================
+# CLI ENTRY POINT
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Profile FHIR R4 datasets with relational analysis.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python profiler_file.py /data/fhir ./output
+    python profiler_file.py --top-n 50 --no-relations /data/fhir ./output
+    python profiler_file.py /data/fhir ./output --skip-types Binary --run-name my_run
+        """
+    )
+
+    parser.add_argument('input_dir', type=Path, help='Directory containing FHIR files')
+    parser.add_argument('output_dir', type=Path, help='Directory for output files')
+    parser.add_argument('--top-n', type=int, default=20, help='Top values to track (default: 20)')
+    parser.add_argument('--hll-precision', type=int, default=14, help='HyperLogLog precision (default: 14)')
+    parser.add_argument('--hll-threshold', type=int, default=10000, help='HLL switch threshold (default: 10000)')
+    parser.add_argument('--no-inline-extensions', action='store_true', help='Don\'t inline extension URLs')
+    parser.add_argument('--no-relations', action='store_true', help='Skip relational analysis')
+    parser.add_argument('--skip-types', type=str, default='',
+                        help='Comma-separated resource types to exclude (e.g. Binary,DocumentReference)')
+    parser.add_argument('--dedup-types', type=str, default=None,
+                        help='Comma-separated resource types counted once even if they appear in several files '
+                             '(default: Medication,Location,Organization,Practitioner,PractitionerRole,Device,Substance)')
+    parser.add_argument('--no-split', action='store_true',
+                        help='Do not profile per group (e.g. Observation per category), only per resource type')
+    parser.add_argument('--max-groups', type=int, default=MAX_GROUPS,
+                        help=f'Maximum groups per resource type, further ones go to "(andere)" (default: {MAX_GROUPS})')
+    parser.add_argument('--run-name', type=str, default=None,
+                        help='Custom name for the output subfolder (default: timestamp)')
+    parser.add_argument('--quiet', '-q', action='store_true', help='Suppress output')
+
+    args = parser.parse_args()
+
+    extra = {}
+    if args.dedup_types is not None:
+        extra['dedup_types'] = {t.strip() for t in args.dedup_types.split(',') if t.strip()}
+
+    config = ProfilerConfig(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        **extra,
+        top_values_limit=args.top_n,
+        hll_precision=args.hll_precision,
+        hll_threshold=args.hll_threshold,
+        inline_extensions=not args.no_inline_extensions,
+        analyze_relations=not args.no_relations,
+        skip_types={t.strip() for t in args.skip_types.split(',') if t.strip()},
+        run_name=args.run_name,
+        split=not args.no_split,
+        max_groups=args.max_groups,
+        verbose=not args.quiet
+    )
+
+    outcome = run_profiler(config)
+    sys.exit(0 if outcome.get('error') is None else 1)
+
+
+if __name__ == '__main__':
+    main()

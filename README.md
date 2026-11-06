@@ -228,7 +228,11 @@ FHIRScan/
 ├── METRICS.md                     # Output metrics reference
 ├── scripts/
 │   ├── profiler_file.py           # File-based profiler (JSON / NDJSON)
-│   └── profiler_server.py         # Server-based profiler (FHIR REST API)
+│   ├── profiler_server.py         # Server-based profiler (FHIR REST API)
+│   └── v2/                        # Same profilers, additionally per group (e.g. Observation by category)
+│       ├── profiler_file.py
+│       ├── profiler_server.py
+│       └── groups.py              # Which field defines the groups, per resource type
 └── heterogeneity_analysis/
     ├── diz_report.ipynb           # Cross-site comparison report (HTML + Excel)
     └── export_report.sh           # ./export_report.sh --run → results/<YYYYMMDD_HHMM>/
